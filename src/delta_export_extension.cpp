@@ -4,9 +4,14 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/prepared_statement.hpp"
+
+#include <map>
 
 namespace duckdb {
 
@@ -39,12 +44,20 @@ active_tables AS (
         s.schema_name,
         t.path AS table_path,
         s.path AS schema_path,
-        rtrim((SELECT data_root FROM data_root_config), '/') || '/' ||
-            CASE
-                WHEN trim(s.path, '/') != '' THEN trim(s.path, '/') || '/'
-                ELSE ''
-            END ||
-            trim(t.path, '/') AS table_root
+        -- DuckLake spec: schema path is relative to data_path, table path is relative to the
+        -- schema path, unless path_is_relative is false (then the path is used as-is).
+        CASE
+            WHEN NOT COALESCE(t.path_is_relative, true) THEN rtrim(t.path, '/')
+            ELSE
+                CASE
+                    WHEN NOT COALESCE(s.path_is_relative, true) THEN rtrim(s.path, '/')
+                    ELSE rtrim((SELECT data_root FROM data_root_config), '/') ||
+                        CASE
+                            WHEN trim(s.path, '/') != '' THEN '/' || trim(s.path, '/')
+                            ELSE ''
+                        END
+                END || '/' || trim(t.path, '/')
+        END AS table_root
     FROM {META}ducklake_table t
     JOIN {META}ducklake_schema s USING(schema_id)
     WHERE t.end_snapshot IS NULL
@@ -92,6 +105,24 @@ SELECT
 FROM table_last_modified;
 )";
 
+// Current columns of every table that will be exported, including nested child columns
+// (parent_column IS NOT NULL). The Delta schema is assembled from these rows in C++.
+static constexpr const char *SQL_GET_EXPORT_COLUMNS = R"(
+SELECT
+    c.table_id,
+    c.column_id,
+    c.column_order,
+    c.column_name,
+    c.column_type,
+    COALESCE(c.nulls_allowed, true) AS nulls_allowed,
+    c.parent_column
+FROM {META}ducklake_column c
+JOIN export_summary es ON es.table_id = c.table_id
+WHERE es.status = 'needs_export'
+  AND c.end_snapshot IS NULL
+ORDER BY c.table_id, c.column_order, c.column_id;
+)";
+
 static constexpr const char *SQL_CREATE_CHECKPOINT_PARQUET = R"(
 CREATE OR REPLACE TEMP TABLE temp_checkpoint_parquet AS
 WITH
@@ -112,37 +143,9 @@ table_schemas AS (
         te.table_name,
         te.snapshot_id,
         te.table_root,
-        list({
-            'name': c.column_name,
-            'type':
-                CASE
-                    WHEN c.column_type IN ('int8', 'tinyint') THEN 'byte'
-                    WHEN c.column_type IN ('int16', 'smallint') THEN 'short'
-                    WHEN c.column_type IN ('int32', 'integer', 'int') THEN 'integer'
-                    WHEN c.column_type IN ('int64', 'bigint') THEN 'long'
-                    WHEN c.column_type IN ('int128', 'hugeint') THEN 'string'
-                    WHEN c.column_type IN ('uint8', 'utinyint') THEN 'short'
-                    WHEN c.column_type IN ('uint16', 'usmallint') THEN 'integer'
-                    WHEN c.column_type IN ('uint32', 'uinteger') THEN 'long'
-                    WHEN c.column_type IN ('uint64', 'ubigint') THEN 'string'
-                    WHEN c.column_type IN ('float32', 'float') THEN 'float'
-                    WHEN c.column_type IN ('float64', 'double') THEN 'double'
-                    WHEN c.column_type = 'boolean' THEN 'boolean'
-                    WHEN contains(c.column_type, 'decimal') THEN c.column_type
-                    WHEN contains(c.column_type, 'timestamp') THEN 'timestamp'
-                    WHEN c.column_type = 'date' THEN 'date'
-                    WHEN c.column_type = 'blob' THEN 'binary'
-                    WHEN c.column_type = 'varchar' THEN 'string'
-                    ELSE 'string'
-                END,
-            'nullable': true,
-            'metadata': MAP{}::MAP(VARCHAR, VARCHAR)
-        }::STRUCT(name VARCHAR, type VARCHAR, nullable BOOLEAN, metadata MAP(VARCHAR, VARCHAR)) ORDER BY c.column_order) AS schema_fields
+        tsj.schema_string
     FROM tables_to_export te
-    JOIN {META}ducklake_table t ON te.table_id = t.table_id
-    JOIN {META}ducklake_column c ON t.table_id = c.table_id
-    WHERE c.end_snapshot IS NULL
-    GROUP BY te.table_id, te.schema_name, te.table_name, te.snapshot_id, te.table_root
+    JOIN table_schema_json tsj USING (table_id)
 ),
 file_column_stats_agg AS (
     SELECT
@@ -161,6 +164,7 @@ file_column_stats_agg AS (
     WHERE df.end_snapshot IS NULL
       AND c.column_id IS NOT NULL
       AND c.end_snapshot IS NULL
+      AND c.parent_column IS NULL
     GROUP BY ts.table_id, df.data_file_id, c.column_name
 ),
 file_column_stats_transformed AS (
@@ -214,9 +218,10 @@ file_metadata AS (
         ts.table_name,
         ts.snapshot_id,
         ts.table_root,
-        ts.schema_fields,
+        ts.schema_string,
         df.data_file_id,
         df.path AS file_path,
+        df.path_is_relative,
         df.file_size_bytes,
         df.record_count AS num_records,
         COALESCE(map_from_entries(list({
@@ -236,7 +241,8 @@ file_metadata AS (
     LEFT JOIN file_column_stats_transformed fct ON df.data_file_id = fct.data_file_id
     WHERE df.end_snapshot IS NULL
     GROUP BY ts.table_id, ts.schema_name, ts.table_name, ts.snapshot_id,
-             ts.table_root, ts.schema_fields, df.data_file_id, df.path, df.file_size_bytes, df.record_count
+             ts.table_root, ts.schema_string, df.data_file_id, df.path, df.path_is_relative,
+             df.file_size_bytes, df.record_count
 ),
 table_aggregates AS (
     SELECT
@@ -245,12 +251,12 @@ table_aggregates AS (
         table_name,
         snapshot_id,
         table_root,
-        schema_fields,
+        schema_string,
         COUNT(*) AS num_files,
         SUM(num_records) AS total_rows,
         SUM(file_size_bytes) AS total_bytes,
         list({
-            'path': ltrim(file_path, '/'),
+            'path': CASE WHEN COALESCE(path_is_relative, true) THEN ltrim(file_path, '/') ELSE file_path END,
             'partitionValues': MAP{}::MAP(VARCHAR, VARCHAR),
             'size': file_size_bytes,
             'modificationTime': epoch_ms(now()),
@@ -272,7 +278,7 @@ table_aggregates AS (
             tags MAP(VARCHAR, VARCHAR)
         )) AS add_entries
     FROM file_metadata
-    GROUP BY table_id, schema_name, table_name, snapshot_id, table_root, schema_fields
+    GROUP BY table_id, schema_name, table_name, snapshot_id, table_root, schema_string
 ),
 checkpoint_data AS (
     SELECT
@@ -284,8 +290,7 @@ checkpoint_data AS (
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 9, 4) || '-' ||
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 13, 4) || '-' ||
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 17, 4) || '-' ||
-         substring(md5(ta.table_id::VARCHAR || '-metadata'), 21, 12)) AS meta_id,
-        to_json({'type': 'struct', 'fields': ta.schema_fields}) AS schema_string
+         substring(md5(ta.table_id::VARCHAR || '-metadata'), 21, 12)) AS meta_id
     FROM table_aggregates ta
 ),
 checkpoint_parquet_data AS (
@@ -539,10 +544,81 @@ ORDER BY
 )";
 
 //===--------------------------------------------------------------------===//
-// Helper: Qualify ducklake_* table names with the metadata catalog prefix
+// Helper: Locate the DuckLake metadata catalog
 //===--------------------------------------------------------------------===//
-static string QualifyMetadataTables(const string &sql, const string &metadata_catalog) {
-	string prefix = metadata_catalog.empty() ? "" : "\"" + metadata_catalog + "\".";
+struct MetadataLocation {
+	//! Catalog holding the ducklake_* tables; empty means "resolve through the search path"
+	string catalog;
+	//! Schema holding the ducklake_* tables (METADATA_SCHEMA attach option); empty means the default schema
+	string schema;
+};
+
+// DuckLake (on DuckDB >= 1.5.3) attaches its metadata catalog HIDDEN unless METADATA_CATALOG is given, so
+// duckdb_databases() no longer lists it. DatabaseManager::GetDatabases includes hidden entries (it is what
+// duckdb_databases() itself calls), and a hidden catalog still resolves by name in queries.
+static MetadataLocation ResolveMetadataLocation(ClientContext &context) {
+	auto &db_manager = DatabaseManager::Get(context);
+	string default_db;
+	try {
+		default_db = DatabaseManager::GetDefaultDatabase(context);
+	} catch (...) {
+		// no default database set; fall back to the first attached lake
+	}
+
+	MetadataLocation default_lake, first_lake, prefixed;
+	bool has_default_lake = false;
+	bool has_first_lake = false;
+	for (auto &db : db_manager.GetDatabases(context)) {
+		if (db->IsSystem() || db->IsTemporary()) {
+			continue;
+		}
+		auto &name = db->GetName();
+		if (db->GetCatalog().GetCatalogType() == "ducklake") {
+			MetadataLocation loc;
+			loc.catalog = "__ducklake_metadata_" + name;
+			// ATTACH option keys are lowercased by the parser; DuckLake leaves them in the map
+			auto &options = db->GetAttachOptions();
+			auto catalog_opt = options.find("metadata_catalog");
+			if (catalog_opt != options.end() && !catalog_opt->second.IsNull()) {
+				loc.catalog = catalog_opt->second.ToString();
+			}
+			auto schema_opt = options.find("metadata_schema");
+			if (schema_opt != options.end() && !schema_opt->second.IsNull()) {
+				loc.schema = schema_opt->second.ToString();
+			}
+			if (!has_first_lake) {
+				first_lake = loc;
+				has_first_lake = true;
+			}
+			if (name == default_db) {
+				default_lake = loc;
+				has_default_lake = true;
+			}
+		} else if (prefixed.catalog.empty() && StringUtil::StartsWith(name, "__ducklake_metadata_")) {
+			// Older DuckLake (visible metadata catalog) or a manually attached metadata database
+			prefixed.catalog = name;
+		}
+	}
+	if (has_default_lake) {
+		return default_lake; // USE lake -> that lake
+	}
+	if (has_first_lake) {
+		return first_lake; // no USE (dbt) -> first attached lake
+	}
+	return prefixed; // may be empty: metadata database attached directly, unqualified names
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: Qualify ducklake_* table names with the metadata catalog/schema prefix
+//===--------------------------------------------------------------------===//
+static string QualifyMetadataTables(const string &sql, const MetadataLocation &meta) {
+	string prefix;
+	if (!meta.catalog.empty()) {
+		prefix += "\"" + meta.catalog + "\".";
+	}
+	if (!meta.schema.empty()) {
+		prefix += "\"" + meta.schema + "\".";
+	}
 	return StringUtil::Replace(sql, "{META}", prefix);
 }
 
@@ -555,6 +631,232 @@ static unique_ptr<MaterializedQueryResult> ExecuteSQL(Connection &conn, const st
 		throw InvalidInputException("Delta export failed: %s\nSQL: %s", result->GetError(), sql.substr(0, 200));
 	}
 	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: Build the Delta Lake schemaString of each exported table
+//===--------------------------------------------------------------------===//
+struct DuckLakeColumn {
+	int64_t column_id = 0;
+	string name;
+	string type;
+	bool nullable = true;
+	bool has_parent = false;
+	int64_t parent_id = 0;
+	//! Indexes (into the table's column vector) of the nested child columns, in column_order
+	vector<idx_t> children;
+};
+
+// DuckLake stores types as internal names (int32, varchar, ...). Delta has no equivalent for uuid, time,
+// timetz, interval, int128 and uint64; those are exported as 'string', which is lossy: Delta readers will
+// not decode the parquet values of such columns.
+static string MapPrimitiveType(const string &column_type) {
+	auto t = StringUtil::Lower(column_type);
+	if (t == "int8" || t == "tinyint") {
+		return "byte";
+	}
+	if (t == "int16" || t == "smallint") {
+		return "short";
+	}
+	if (t == "int32" || t == "integer" || t == "int") {
+		return "integer";
+	}
+	if (t == "int64" || t == "bigint") {
+		return "long";
+	}
+	if (t == "uint8" || t == "utinyint") {
+		return "short";
+	}
+	if (t == "uint16" || t == "usmallint") {
+		return "integer";
+	}
+	if (t == "uint32" || t == "uinteger") {
+		return "long";
+	}
+	if (t == "uint64" || t == "ubigint" || t == "int128" || t == "hugeint" || t == "uint128" || t == "uhugeint") {
+		return "string";
+	}
+	if (t == "float32" || t == "float") {
+		return "float";
+	}
+	if (t == "float64" || t == "double") {
+		return "double";
+	}
+	if (t == "boolean") {
+		return "boolean";
+	}
+	if (t == "date") {
+		return "date";
+	}
+	if (t == "blob") {
+		return "binary";
+	}
+	if (t == "varchar") {
+		return "string";
+	}
+	if (StringUtil::StartsWith(t, "decimal")) {
+		return StringUtil::Replace(t, " ", "");
+	}
+	if (StringUtil::Contains(t, "timestamp")) {
+		return "timestamp";
+	}
+	// json is stored as a string in parquet; uuid, time, timetz and interval have no Delta equivalent
+	return "string";
+}
+
+static string JsonEscape(const string &input) {
+	static const char *HEX = "0123456789abcdef";
+	string out;
+	out.reserve(input.size() + 2);
+	for (auto ch : input) {
+		auto c = static_cast<unsigned char>(ch);
+		switch (c) {
+		case '"':
+			out += "\\\"";
+			break;
+		case '\\':
+			out += "\\\\";
+			break;
+		case '\n':
+			out += "\\n";
+			break;
+		case '\r':
+			out += "\\r";
+			break;
+		case '\t':
+			out += "\\t";
+			break;
+		default:
+			if (c < 0x20) {
+				out += "\\u00";
+				out += HEX[c >> 4];
+				out += HEX[c & 0xF];
+			} else {
+				out += ch;
+			}
+		}
+	}
+	return out;
+}
+
+static string BuildDeltaType(const vector<DuckLakeColumn> &columns, idx_t idx);
+
+static string BuildDeltaField(const vector<DuckLakeColumn> &columns, idx_t idx) {
+	auto &col = columns[idx];
+	return "{\"name\":\"" + JsonEscape(col.name) + "\",\"type\":" + BuildDeltaType(columns, idx) +
+	       ",\"nullable\":" + (col.nullable ? "true" : "false") + ",\"metadata\":{}}";
+}
+
+static string BuildDeltaType(const vector<DuckLakeColumn> &columns, idx_t idx) {
+	auto &col = columns[idx];
+	auto t = StringUtil::Lower(col.type);
+	if (t == "struct") {
+		string fields;
+		for (auto child : col.children) {
+			if (!fields.empty()) {
+				fields += ",";
+			}
+			fields += BuildDeltaField(columns, child);
+		}
+		return "{\"type\":\"struct\",\"fields\":[" + fields + "]}";
+	}
+	if (t == "list") {
+		if (col.children.empty()) {
+			throw InvalidInputException("Delta export failed: list column \"%s\" has no element column", col.name);
+		}
+		auto &element = columns[col.children[0]];
+		return "{\"type\":\"array\",\"elementType\":" + BuildDeltaType(columns, col.children[0]) +
+		       ",\"containsNull\":" + (element.nullable ? "true" : "false") + "}";
+	}
+	if (t == "map") {
+		idx_t key_idx = DConstants::INVALID_INDEX;
+		idx_t value_idx = DConstants::INVALID_INDEX;
+		for (auto child : col.children) {
+			if (columns[child].name == "key" && key_idx == DConstants::INVALID_INDEX) {
+				key_idx = child;
+			} else if (columns[child].name == "value" && value_idx == DConstants::INVALID_INDEX) {
+				value_idx = child;
+			}
+		}
+		if (key_idx == DConstants::INVALID_INDEX || value_idx == DConstants::INVALID_INDEX) {
+			if (col.children.size() != 2) {
+				throw InvalidInputException("Delta export failed: map column \"%s\" has no key/value columns",
+				                            col.name);
+			}
+			key_idx = col.children[0];
+			value_idx = col.children[1];
+		}
+		auto &value = columns[value_idx];
+		return "{\"type\":\"map\",\"keyType\":" + BuildDeltaType(columns, key_idx) +
+		       ",\"valueType\":" + BuildDeltaType(columns, value_idx) +
+		       ",\"valueContainsNull\":" + (value.nullable ? "true" : "false") + "}";
+	}
+	return "\"" + MapPrimitiveType(t) + "\"";
+}
+
+static string BuildDeltaSchema(vector<DuckLakeColumn> &columns) {
+	// Link nested child columns to their parents (columns arrive in column_order)
+	std::map<int64_t, idx_t> index_of;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		index_of[columns[i].column_id] = i;
+	}
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (!columns[i].has_parent) {
+			continue;
+		}
+		auto parent = index_of.find(columns[i].parent_id);
+		if (parent == index_of.end()) {
+			throw InvalidInputException("Delta export failed: column \"%s\" references unknown parent column %s",
+			                            columns[i].name, std::to_string(columns[i].parent_id));
+		}
+		columns[parent->second].children.push_back(i);
+	}
+	string fields;
+	for (idx_t i = 0; i < columns.size(); i++) {
+		if (columns[i].has_parent) {
+			continue;
+		}
+		if (!fields.empty()) {
+			fields += ",";
+		}
+		fields += BuildDeltaField(columns, i);
+	}
+	return "{\"type\":\"struct\",\"fields\":[" + fields + "]}";
+}
+
+// Fills TEMP table table_schema_json(table_id, schema_string). TEMP tables are per connection, so this must
+// run on the same Connection as the rest of the export.
+static void BuildTableSchemas(Connection &conn, const MetadataLocation &meta) {
+	ExecuteSQL(conn, "CREATE OR REPLACE TEMP TABLE table_schema_json (table_id BIGINT, schema_string VARCHAR);");
+	auto columns_result = ExecuteSQL(conn, QualifyMetadataTables(SQL_GET_EXPORT_COLUMNS, meta));
+
+	std::map<int64_t, vector<DuckLakeColumn>> table_columns;
+	for (idx_t i = 0; i < columns_result->RowCount(); i++) {
+		auto table_id = columns_result->GetValue(0, i).GetValue<int64_t>();
+		DuckLakeColumn col;
+		col.column_id = columns_result->GetValue(1, i).GetValue<int64_t>();
+		col.name = columns_result->GetValue(3, i).ToString();
+		col.type = columns_result->GetValue(4, i).ToString();
+		col.nullable = columns_result->GetValue(5, i).GetValue<bool>();
+		auto parent = columns_result->GetValue(6, i);
+		if (!parent.IsNull()) {
+			col.has_parent = true;
+			col.parent_id = parent.GetValue<int64_t>();
+		}
+		table_columns[table_id].push_back(std::move(col));
+	}
+
+	auto insert = conn.Prepare("INSERT INTO table_schema_json VALUES ($1, $2)");
+	if (insert->HasError()) {
+		throw InvalidInputException("Delta export failed: %s", insert->GetError());
+	}
+	for (auto &entry : table_columns) {
+		auto schema_string = BuildDeltaSchema(entry.second);
+		auto result = insert->Execute(Value::BIGINT(entry.first), Value(schema_string));
+		if (result->HasError()) {
+			throw InvalidInputException("Delta export failed: %s", result->GetError());
+		}
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -627,20 +929,19 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 	// ── Run export on the current database ──
 	// Use a separate Connection to avoid deadlocking context.Query() inside a scan
 	Connection conn(*context.db);
-	// Find the DuckLake metadata catalog — works with USE, dbt (no USE), or direct attach
-	string metadata_catalog;
-	auto db_check = conn.Query("SELECT database_name FROM duckdb_databases() WHERE starts_with(database_name, "
-	                           "'__ducklake_metadata_') LIMIT 1");
-	if (!db_check->HasError() && db_check->RowCount() > 0) {
-		metadata_catalog = db_check->GetValue(0, 0).ToString();
-	}
+	// Locate the DuckLake metadata catalog from the main context — works with USE, dbt (no USE), a hidden
+	// metadata catalog (DuckLake on DuckDB >= 1.5.3), METADATA_CATALOG / METADATA_SCHEMA, or a direct attach
+	auto meta = ResolveMetadataLocation(context);
 
 	// Step 1: Build export summary (reads ducklake_* tables)
 	ExecuteSQL(conn, SQL_CREATE_EXPORT_SUMMARY);
-	ExecuteSQL(conn, QualifyMetadataTables(SQL_INSERT_EXPORT_SUMMARY, metadata_catalog));
+	ExecuteSQL(conn, QualifyMetadataTables(SQL_INSERT_EXPORT_SUMMARY, meta));
 
-	// Step 2: Generate checkpoint parquet data (reads ducklake_* tables)
-	ExecuteSQL(conn, QualifyMetadataTables(SQL_CREATE_CHECKPOINT_PARQUET, metadata_catalog));
+	// Step 2: Build the Delta schema of every exported table (nested types, nulls_allowed)
+	BuildTableSchemas(conn, meta);
+
+	// Step 3: Generate checkpoint parquet data (reads ducklake_* tables)
+	ExecuteSQL(conn, QualifyMetadataTables(SQL_CREATE_CHECKPOINT_PARQUET, meta));
 
 	// Step 4: Generate JSON checkpoint
 	ExecuteSQL(conn, SQL_CREATE_CHECKPOINT_JSON);
