@@ -10,8 +10,16 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/prepared_statement.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/random_engine.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <map>
+#include <set>
 
 namespace duckdb {
 
@@ -27,40 +35,55 @@ CREATE OR REPLACE TEMP TABLE export_summary (
     table_root VARCHAR,
     status VARCHAR,
     snapshot_id BIGINT,
-    message VARCHAR
+    message VARCHAR,
+    table_uuid VARCHAR,
+    schema_uuid VARCHAR
 );
+)";
+
+// Storage roots of every schema and of every ducklake_table row, live and dropped.
+static constexpr const char *SQL_CREATE_TABLE_ROOTS = R"(
+CREATE OR REPLACE TEMP TABLE schema_roots AS
+WITH data_root_config AS (
+    SELECT value AS data_root FROM {META}ducklake_metadata WHERE key = 'data_path'
+)
+SELECT
+    s.schema_id,
+    s.schema_name,
+    s.schema_uuid::VARCHAR AS schema_uuid,
+    -- DuckLake spec: schema path is relative to data_path unless path_is_relative is false
+    CASE
+        WHEN NOT COALESCE(s.path_is_relative, true) THEN rtrim(s.path, '/')
+        ELSE rtrim((SELECT data_root FROM data_root_config), '/') ||
+            CASE
+                WHEN trim(s.path, '/') != '' THEN '/' || trim(s.path, '/')
+                ELSE ''
+            END
+    END AS schema_root
+FROM {META}ducklake_schema s;
+
+CREATE OR REPLACE TEMP TABLE table_roots AS
+SELECT
+    t.table_id,
+    t.table_name,
+    sr.schema_name,
+    t.end_snapshot,
+    t.table_uuid::VARCHAR AS table_uuid,
+    sr.schema_uuid,
+    -- table path is relative to the schema path unless path_is_relative is false
+    CASE
+        WHEN NOT COALESCE(t.path_is_relative, true) THEN rtrim(t.path, '/')
+        ELSE sr.schema_root || '/' || trim(t.path, '/')
+    END AS table_root
+FROM {META}ducklake_table t
+JOIN schema_roots sr USING (schema_id);
 )";
 
 static constexpr const char *SQL_INSERT_EXPORT_SUMMARY = R"(
 INSERT INTO export_summary
 WITH
-data_root_config AS (
-    SELECT value AS data_root FROM {META}ducklake_metadata WHERE key = 'data_path'
-),
 active_tables AS (
-    SELECT
-        t.table_id,
-        t.table_name,
-        s.schema_name,
-        t.path AS table_path,
-        s.path AS schema_path,
-        -- DuckLake spec: schema path is relative to data_path, table path is relative to the
-        -- schema path, unless path_is_relative is false (then the path is used as-is).
-        CASE
-            WHEN NOT COALESCE(t.path_is_relative, true) THEN rtrim(t.path, '/')
-            ELSE
-                CASE
-                    WHEN NOT COALESCE(s.path_is_relative, true) THEN rtrim(s.path, '/')
-                    ELSE rtrim((SELECT data_root FROM data_root_config), '/') ||
-                        CASE
-                            WHEN trim(s.path, '/') != '' THEN '/' || trim(s.path, '/')
-                            ELSE ''
-                        END
-                END || '/' || trim(t.path, '/')
-        END AS table_root
-    FROM {META}ducklake_table t
-    JOIN {META}ducklake_schema s USING(schema_id)
-    WHERE t.end_snapshot IS NULL
+    SELECT * FROM table_roots WHERE end_snapshot IS NULL
 ),
 current_snapshot AS (
     SELECT MAX(snapshot_id) AS snapshot_id FROM {META}ducklake_snapshot
@@ -101,8 +124,43 @@ SELECT
     CASE
         WHEN file_count = 0 THEN 'Table has no data files (empty table)'
         ELSE 'Ready for export'
-    END AS message
+    END AS message,
+    table_uuid,
+    schema_uuid
 FROM table_last_modified;
+)";
+
+// Active DuckLake delete files of the exported tables. Paths are relative to the table root like data files.
+static constexpr const char *SQL_GET_DELETE_FILES = R"(
+SELECT
+    es.table_id,
+    del.data_file_id,
+    CASE
+        WHEN COALESCE(del.path_is_relative, true) THEN es.table_root || '/' || ltrim(del.path, '/')
+        ELSE del.path
+    END AS delete_path
+FROM {META}ducklake_delete_file del
+JOIN export_summary es ON es.table_id = del.table_id
+JOIN {META}ducklake_data_file df ON df.data_file_id = del.data_file_id AND df.end_snapshot IS NULL
+WHERE es.status = 'needs_export'
+  AND del.end_snapshot IS NULL
+ORDER BY es.table_id, del.data_file_id;
+)";
+
+// Dropped tables whose storage root no live table uses any more.
+static constexpr const char *SQL_GET_DROPPED_TABLES = R"(
+SELECT
+    table_root,
+    arg_max(table_id, end_snapshot) AS table_id,
+    arg_max(schema_name, end_snapshot) AS schema_name,
+    arg_max(table_name, end_snapshot) AS table_name,
+    arg_max(schema_uuid, end_snapshot) AS schema_uuid
+FROM table_roots tr
+WHERE tr.end_snapshot IS NOT NULL
+  AND tr.table_root IS NOT NULL
+  AND tr.table_id NOT IN (SELECT table_id FROM export_summary)
+  AND tr.table_root NOT IN (SELECT table_root FROM export_summary WHERE table_root IS NOT NULL)
+GROUP BY table_root;
 )";
 
 // Current columns of every table that will be exported, including nested child columns
@@ -160,7 +218,8 @@ file_column_stats_agg AS (
     FROM table_schemas ts
     JOIN {META}ducklake_data_file df ON ts.table_id = df.table_id
     LEFT JOIN {META}ducklake_file_column_stats fcs ON df.data_file_id = fcs.data_file_id
-    LEFT JOIN {META}ducklake_column c ON fcs.column_id = c.column_id
+    -- column_id is only unique within a table
+    LEFT JOIN {META}ducklake_column c ON fcs.column_id = c.column_id AND c.table_id = df.table_id
     WHERE df.end_snapshot IS NULL
       AND c.column_id IS NOT NULL
       AND c.end_snapshot IS NULL
@@ -224,6 +283,11 @@ file_metadata AS (
         df.path_is_relative,
         df.file_size_bytes,
         df.record_count AS num_records,
+        dv.storage_type AS dv_storage_type,
+        dv.path_or_inline_dv AS dv_path,
+        dv.dv_offset,
+        dv.size_in_bytes AS dv_size,
+        dv.cardinality AS dv_cardinality,
         COALESCE(map_from_entries(list({
             'key': fct.column_name,
             'value': fct.transformed_min
@@ -238,11 +302,13 @@ file_metadata AS (
         } ORDER BY fct.column_name) FILTER (WHERE fct.column_name IS NOT NULL AND fct.null_count IS NOT NULL)), MAP{}::MAP(VARCHAR, BIGINT)) AS null_count
     FROM table_schemas ts
     JOIN {META}ducklake_data_file df ON ts.table_id = df.table_id
+    LEFT JOIN table_deletion_vectors dv ON dv.data_file_id = df.data_file_id
     LEFT JOIN file_column_stats_transformed fct ON df.data_file_id = fct.data_file_id
     WHERE df.end_snapshot IS NULL
     GROUP BY ts.table_id, ts.schema_name, ts.table_name, ts.snapshot_id,
              ts.table_root, ts.schema_string, df.data_file_id, df.path, df.path_is_relative,
-             df.file_size_bytes, df.record_count
+             df.file_size_bytes, df.record_count, dv.storage_type, dv.path_or_inline_dv,
+             dv.dv_offset, dv.size_in_bytes, dv.cardinality
 ),
 table_aggregates AS (
     SELECT
@@ -253,21 +319,43 @@ table_aggregates AS (
         table_root,
         schema_string,
         COUNT(*) AS num_files,
-        SUM(num_records) AS total_rows,
+        SUM(num_records) - COALESCE(SUM(dv_cardinality), 0) AS total_rows,
         SUM(file_size_bytes) AS total_bytes,
+        bool_or(dv_storage_type IS NOT NULL) AS has_dv,
         list({
             'path': CASE WHEN COALESCE(path_is_relative, true) THEN ltrim(file_path, '/') ELSE file_path END,
             'partitionValues': MAP{}::MAP(VARCHAR, VARCHAR),
             'size': file_size_bytes,
             'modificationTime': epoch_ms(now()),
             'dataChange': true,
-            'stats': COALESCE(to_json({
-                'numRecords': COALESCE(num_records, 0),
-                'minValues': COALESCE(min_values, MAP{}::MAP(VARCHAR, VARCHAR)),
-                'maxValues': COALESCE(max_values, MAP{}::MAP(VARCHAR, VARCHAR)),
-                'nullCount': COALESCE(null_count, MAP{}::MAP(VARCHAR, BIGINT))
-            }), '{"numRecords":0}'),
-            'tags': MAP{}::MAP(VARCHAR, VARCHAR)
+            -- numRecords is the physical row count; with a deletion vector the bounds may be wider than the live rows
+            'stats': COALESCE(
+                CASE
+                    WHEN dv_storage_type IS NULL THEN to_json({
+                        'numRecords': COALESCE(num_records, 0),
+                        'minValues': COALESCE(min_values, MAP{}::MAP(VARCHAR, VARCHAR)),
+                        'maxValues': COALESCE(max_values, MAP{}::MAP(VARCHAR, VARCHAR)),
+                        'nullCount': COALESCE(null_count, MAP{}::MAP(VARCHAR, BIGINT))
+                    })
+                    ELSE to_json({
+                        'numRecords': COALESCE(num_records, 0),
+                        'minValues': COALESCE(min_values, MAP{}::MAP(VARCHAR, VARCHAR)),
+                        'maxValues': COALESCE(max_values, MAP{}::MAP(VARCHAR, VARCHAR)),
+                        'nullCount': COALESCE(null_count, MAP{}::MAP(VARCHAR, BIGINT)),
+                        'tightBounds': false
+                    })
+                END, '{"numRecords":0}'),
+            'tags': MAP{}::MAP(VARCHAR, VARCHAR),
+            'deletionVector': CASE
+                WHEN dv_storage_type IS NULL THEN NULL
+                ELSE {
+                    'storageType': dv_storage_type,
+                    'pathOrInlineDv': dv_path,
+                    'offset': dv_offset,
+                    'sizeInBytes': dv_size,
+                    'cardinality': dv_cardinality
+                }
+            END
         }::STRUCT(
             path VARCHAR,
             partitionValues MAP(VARCHAR, VARCHAR),
@@ -275,7 +363,8 @@ table_aggregates AS (
             modificationTime BIGINT,
             dataChange BOOLEAN,
             stats VARCHAR,
-            tags MAP(VARCHAR, VARCHAR)
+            tags MAP(VARCHAR, VARCHAR),
+            deletionVector STRUCT(storageType VARCHAR, pathOrInlineDv VARCHAR, "offset" INTEGER, sizeInBytes INTEGER, cardinality BIGINT)
         )) AS add_entries
     FROM file_metadata
     GROUP BY table_id, schema_name, table_name, snapshot_id, table_root, schema_string
@@ -283,15 +372,20 @@ table_aggregates AS (
 checkpoint_data AS (
     SELECT
         ta.*,
+        COALESCE(es.table_uuid, '') AS table_uuid,
+        COALESCE(es.schema_uuid, '') AS schema_uuid,
         now() AS now_ts,
         epoch_ms(now()) AS now_ms,
         uuid()::VARCHAR AS txn_id,
-        (substring(md5(ta.table_id::VARCHAR || '-metadata'), 1, 8) || '-' ||
+        -- the DuckLake table uuid: a replaced table (CREATE OR REPLACE) gets a new Delta table id
+        COALESCE(es.table_uuid,
+         substring(md5(ta.table_id::VARCHAR || '-metadata'), 1, 8) || '-' ||
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 9, 4) || '-' ||
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 13, 4) || '-' ||
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 17, 4) || '-' ||
          substring(md5(ta.table_id::VARCHAR || '-metadata'), 21, 12)) AS meta_id
     FROM table_aggregates ta
+    JOIN export_summary es USING (table_id)
 ),
 checkpoint_parquet_data AS (
     SELECT
@@ -307,7 +401,19 @@ checkpoint_parquet_data AS (
         cd.num_files,
         cd.total_rows,
         cd.total_bytes,
-        {'minReaderVersion': 1, 'minWriterVersion': 2} AS protocol,
+        cd.has_dv,
+        cd.table_uuid,
+        cd.schema_uuid,
+        -- deletion vectors need reader 3 / writer 7; other tables keep the widely readable 1 / 2
+        CASE
+            WHEN cd.has_dv THEN {
+                'minReaderVersion': 3, 'minWriterVersion': 7,
+                'readerFeatures': ['deletionVectors'], 'writerFeatures': ['deletionVectors']
+            }::STRUCT(minReaderVersion INTEGER, minWriterVersion INTEGER, readerFeatures VARCHAR[], writerFeatures VARCHAR[])
+            ELSE {
+                'minReaderVersion': 1, 'minWriterVersion': 2, 'readerFeatures': NULL, 'writerFeatures': NULL
+            }::STRUCT(minReaderVersion INTEGER, minWriterVersion INTEGER, readerFeatures VARCHAR[], writerFeatures VARCHAR[])
+        END AS protocol,
         NULL AS metaData,
         NULL AS add,
         NULL::STRUCT(
@@ -341,6 +447,9 @@ checkpoint_parquet_data AS (
         cd.num_files,
         cd.total_rows,
         cd.total_bytes,
+        cd.has_dv,
+        cd.table_uuid,
+        cd.schema_uuid,
         NULL AS protocol,
         {
             'id': cd.meta_id,
@@ -349,7 +458,10 @@ checkpoint_parquet_data AS (
             'schemaString': cd.schema_string,
             'partitionColumns': []::VARCHAR[],
             'createdTime': cd.now_ms,
-            'configuration': MAP{}::MAP(VARCHAR, VARCHAR)
+            'configuration': CASE
+                WHEN cd.has_dv THEN MAP{'delta.enableDeletionVectors': 'true'}
+                ELSE MAP{}::MAP(VARCHAR, VARCHAR)
+            END
         }::STRUCT(
             id VARCHAR,
             name VARCHAR,
@@ -391,6 +503,9 @@ checkpoint_parquet_data AS (
         cd.num_files,
         cd.total_rows,
         cd.total_bytes,
+        cd.has_dv,
+        cd.table_uuid,
+        cd.schema_uuid,
         NULL AS protocol,
         NULL AS metaData,
         unnest(cd.add_entries) AS add,
@@ -415,6 +530,7 @@ checkpoint_parquet_data AS (
 SELECT * FROM checkpoint_parquet_data;
 )";
 
+// duckLakeSchemaUuid marks which DuckLake schema owns the log: dropped-table cleanup only removes logs it owns
 static constexpr const char *SQL_CREATE_CHECKPOINT_JSON = R"(
 CREATE OR REPLACE TEMP TABLE temp_checkpoint_json AS
 SELECT DISTINCT
@@ -429,6 +545,8 @@ SELECT DISTINCT
             'operationParameters': {
                 'convertedFrom': 'DuckLake',
                 'duckLakeSnapshotId': p.snapshot_id::VARCHAR,
+                'duckLakeTableUuid': p.table_uuid,
+                'duckLakeSchemaUuid': p.schema_uuid,
                 'partitionBy': '[]'
             },
             'isolationLevel': 'Serializable',
@@ -450,54 +568,48 @@ SELECT DISTINCT
             'schemaString': p.schema_string::VARCHAR,
             'partitionColumns': [],
             'createdTime': p.now_ms,
-            'configuration': MAP{}
+            'configuration': CASE
+                WHEN p.has_dv THEN MAP{'delta.enableDeletionVectors': 'true'}
+                ELSE MAP{}::MAP(VARCHAR, VARCHAR)
+            END
         }
     }) || chr(10) ||
-    to_json({
-        'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}
-    }) AS content
+    CASE
+        WHEN p.has_dv THEN to_json({
+            'protocol': {
+                'minReaderVersion': 3, 'minWriterVersion': 7,
+                'readerFeatures': ['deletionVectors'], 'writerFeatures': ['deletionVectors']
+            }
+        })
+        ELSE to_json({
+            'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}
+        })
+    END AS content
 FROM temp_checkpoint_parquet p
 WHERE p.row_order = 1;
 )";
 
+// _last_checkpoint content is assembled in C++ once the Delta version is known
 static constexpr const char *SQL_CREATE_LAST_CHECKPOINT = R"(
 CREATE OR REPLACE TEMP TABLE temp_last_checkpoint AS
 SELECT
     table_id,
     table_root,
     snapshot_id,
-    '{"version":' || snapshot_id || ',"size":' || (2 + num_files) || '}' AS content
+    2 + num_files AS size
 FROM temp_checkpoint_parquet
 GROUP BY table_id, table_root, snapshot_id, num_files;
 )";
 
 static constexpr const char *SQL_CREATE_EXPORT_PATHS = R"(
-CREATE OR REPLACE TEMP TABLE numbered_exports AS
+CREATE OR REPLACE TEMP TABLE export_paths AS
 SELECT
+    ROW_NUMBER() OVER (ORDER BY table_id) AS export_order,
     table_id,
     table_root,
     snapshot_id,
-    ROW_NUMBER() OVER (ORDER BY table_id) AS export_order
+    table_root || '/_delta_log' AS delta_log_path
 FROM (SELECT DISTINCT table_id, table_root, snapshot_id FROM temp_checkpoint_parquet);
-
-CREATE OR REPLACE TEMP TABLE export_paths AS
-SELECT
-    ne.export_order,
-    ne.table_id,
-    ne.table_root,
-    ne.snapshot_id,
-    paths.checkpoint_file,
-    paths.json_file,
-    paths.last_checkpoint_file,
-    paths.delta_log_path
-FROM numbered_exports ne,
-LATERAL (
-    SELECT
-        ne.table_root || '/_delta_log/' || lpad(ne.snapshot_id::VARCHAR, 20, '0') || '.checkpoint.parquet' AS checkpoint_file,
-        ne.table_root || '/_delta_log/' || lpad(ne.snapshot_id::VARCHAR, 20, '0') || '.json' AS json_file,
-        ne.table_root || '/_delta_log/_last_checkpoint' AS last_checkpoint_file,
-        ne.table_root || '/_delta_log' AS delta_log_path
-) AS paths;
 )";
 
 static constexpr const char *SQL_GET_LOCAL_DIRS = R"(
@@ -517,9 +629,7 @@ SELECT
     table_id,
     table_root,
     snapshot_id,
-    checkpoint_file,
-    json_file,
-    last_checkpoint_file
+    delta_log_path
 FROM export_paths
 ORDER BY export_order;
 )";
@@ -532,6 +642,8 @@ SELECT
     CASE
         WHEN status = 'no_data_files' THEN 'Table has 0 parquet files (empty)'
         WHEN status = 'needs_export' THEN 'Data snapshot ' || snapshot_id || ' exported to Delta'
+        WHEN status = 'removed_dropped' THEN 'Table was dropped in DuckLake; its Delta log was removed'
+        WHEN status = 'remove_failed' THEN 'Table was dropped in DuckLake; removing its Delta log failed'
     END AS explanation,
     message
 FROM export_summary
@@ -539,6 +651,8 @@ ORDER BY
     CASE status
         WHEN 'needs_export' THEN 1
         WHEN 'no_data_files' THEN 2
+        WHEN 'removed_dropped' THEN 3
+        WHEN 'remove_failed' THEN 4
     END,
     schema_name, table_name;
 )";
@@ -863,6 +977,484 @@ static void BuildTableSchemas(Connection &conn, const MetadataLocation &meta) {
 // Table Function: delta_export
 //===--------------------------------------------------------------------===//
 
+//===--------------------------------------------------------------------===//
+// Helper: paths and files
+//===--------------------------------------------------------------------===//
+static bool IsRemotePath(const string &path) {
+	return StringUtil::Contains(path, "://");
+}
+
+// Forward slashes, no duplicate or trailing slash, no leading "./" — for comparing storage roots
+static string NormalizePath(string path) {
+	std::replace(path.begin(), path.end(), '\\', '/');
+	string out;
+	for (auto ch : path) {
+		if (ch == '/' && !out.empty() && out.back() == '/' && !(out.size() >= 2 && out[out.size() - 2] == ':')) {
+			continue;
+		}
+		out += ch;
+	}
+	while (out.size() > 1 && out.back() == '/') {
+		out.pop_back();
+	}
+	if (StringUtil::StartsWith(out, "./")) {
+		out = out.substr(2);
+	}
+	return out;
+}
+
+static string BaseName(const string &path) {
+	auto pos = path.find_last_of("/\\");
+	return pos == string::npos ? path : path.substr(pos + 1);
+}
+
+static string EscapeSqlString(const string &input) {
+	return StringUtil::Replace(input, "'", "''");
+}
+
+static vector<OpenFileInfo> GlobOrEmpty(FileSystem &fs, const string &pattern) {
+	try {
+		return fs.Glob(pattern);
+	} catch (std::exception &) {
+		return {};
+	}
+}
+
+//! Delta version of a _delta_log file name (00000000000000000012.json, .checkpoint.parquet, ...), or -1
+static int64_t DeltaVersionOf(const string &file_name) {
+	if (file_name.size() < 21 || file_name[20] != '.') {
+		return -1;
+	}
+	for (idx_t i = 0; i < 20; i++) {
+		if (!StringUtil::CharacterIsDigit(file_name[i])) {
+			return -1;
+		}
+	}
+	return std::stoll(file_name.substr(0, 20));
+}
+
+//! Highest version already present in a _delta_log, or -1 when there is none
+static int64_t ExistingMaxDeltaVersion(FileSystem &fs, const string &delta_log) {
+	int64_t max_version = -1;
+	for (auto &file : GlobOrEmpty(fs, delta_log + "/*")) {
+		max_version = MaxValue<int64_t>(max_version, DeltaVersionOf(BaseName(file.path)));
+	}
+	return max_version;
+}
+
+static string DeltaLogFile(const string &delta_log, int64_t version, const string &suffix) {
+	auto v = std::to_string(version);
+	return delta_log + "/" + string(20 - MinValue<idx_t>(v.size(), 20), '0') + v + suffix;
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: Delta deletion vectors
+//===--------------------------------------------------------------------===//
+// Delta PROTOCOL.md "Deletion Vector Format": a 64-bit RoaringTreemap in the portable format, prefixed with a magic
+// number, stored in a file as [version byte 1] then per vector [size int32 BE][bitmap][CRC-32 int32 BE].
+static constexpr uint32_t DV_PORTABLE_MAGIC = 1681511377;
+static constexpr uint32_t ROARING_SERIAL_COOKIE_NO_RUNCONTAINER = 12346;
+static constexpr idx_t ROARING_ARRAY_CONTAINER_MAX = 4096;
+
+static void AppendLE16(string &out, uint16_t v) {
+	out += static_cast<char>(v & 0xFF);
+	out += static_cast<char>((v >> 8) & 0xFF);
+}
+
+static void AppendLE32(string &out, uint32_t v) {
+	for (idx_t i = 0; i < 4; i++) {
+		out += static_cast<char>((v >> (8 * i)) & 0xFF);
+	}
+}
+
+static void AppendLE64(string &out, uint64_t v) {
+	for (idx_t i = 0; i < 8; i++) {
+		out += static_cast<char>((v >> (8 * i)) & 0xFF);
+	}
+}
+
+static void AppendBE32(string &out, uint32_t v) {
+	for (idx_t i = 0; i < 4; i++) {
+		out += static_cast<char>((v >> (8 * (3 - i))) & 0xFF);
+	}
+}
+
+// 32-bit RoaringBitmap portable serialization with array and bitmap containers only (no run containers)
+static string SerializeRoaring32(const vector<uint32_t> &values) {
+	struct Container {
+		uint16_t key;
+		vector<uint16_t> lows;
+	};
+	vector<Container> containers;
+	for (auto value : values) {
+		auto key = static_cast<uint16_t>(value >> 16);
+		if (containers.empty() || containers.back().key != key) {
+			containers.push_back(Container {key, {}});
+		}
+		containers.back().lows.push_back(static_cast<uint16_t>(value & 0xFFFF));
+	}
+	string out;
+	AppendLE32(out, ROARING_SERIAL_COOKIE_NO_RUNCONTAINER);
+	AppendLE32(out, static_cast<uint32_t>(containers.size()));
+	for (auto &c : containers) {
+		AppendLE16(out, c.key);
+		AppendLE16(out, static_cast<uint16_t>(c.lows.size() - 1));
+	}
+	// offset header: byte offset of each container from the start of this bitmap
+	uint32_t offset = static_cast<uint32_t>(8 + 8 * containers.size());
+	for (auto &c : containers) {
+		AppendLE32(out, offset);
+		offset += c.lows.size() <= ROARING_ARRAY_CONTAINER_MAX ? static_cast<uint32_t>(2 * c.lows.size()) : 8192;
+	}
+	for (auto &c : containers) {
+		if (c.lows.size() <= ROARING_ARRAY_CONTAINER_MAX) {
+			for (auto low : c.lows) {
+				AppendLE16(out, low);
+			}
+		} else {
+			std::array<uint64_t, 1024> words {};
+			for (auto low : c.lows) {
+				words[low >> 6] |= uint64_t(1) << (low & 63);
+			}
+			for (auto word : words) {
+				AppendLE64(out, word);
+			}
+		}
+	}
+	return out;
+}
+
+//! positions must be sorted and unique
+static string SerializeDeletionVector(const vector<uint64_t> &positions) {
+	string out;
+	AppendLE32(out, DV_PORTABLE_MAGIC);
+	vector<std::pair<uint32_t, vector<uint32_t>>> buckets;
+	for (auto pos : positions) {
+		auto high = static_cast<uint32_t>(pos >> 32);
+		if (buckets.empty() || buckets.back().first != high) {
+			buckets.emplace_back(high, vector<uint32_t>());
+		}
+		buckets.back().second.push_back(static_cast<uint32_t>(pos & 0xFFFFFFFF));
+	}
+	AppendLE64(out, buckets.size());
+	for (auto &bucket : buckets) {
+		AppendLE32(out, bucket.first);
+		out += SerializeRoaring32(bucket.second);
+	}
+	return out;
+}
+
+static uint32_t Crc32(const string &data) {
+	static const auto table = [] {
+		std::array<uint32_t, 256> t {};
+		for (uint32_t i = 0; i < 256; i++) {
+			uint32_t c = i;
+			for (idx_t k = 0; k < 8; k++) {
+				c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+			}
+			t[i] = c;
+		}
+		return t;
+	}();
+	uint32_t crc = 0xFFFFFFFFu;
+	for (auto ch : data) {
+		crc = table[(crc ^ static_cast<uint8_t>(ch)) & 0xFF] ^ (crc >> 8);
+	}
+	return crc ^ 0xFFFFFFFFu;
+}
+
+// Z85, the base85 variant Delta uses to encode the deletion vector file uuid in pathOrInlineDv
+static string Z85Encode(const uint8_t *data, idx_t len) {
+	static const char *Z85_CHARS =
+	    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
+	string out;
+	for (idx_t i = 0; i + 4 <= len; i += 4) {
+		uint32_t value = (uint32_t(data[i]) << 24) | (uint32_t(data[i + 1]) << 16) | (uint32_t(data[i + 2]) << 8) |
+		                 uint32_t(data[i + 3]);
+		char chunk[5];
+		for (int j = 4; j >= 0; j--) {
+			chunk[j] = Z85_CHARS[value % 85];
+			value /= 85;
+		}
+		out.append(chunk, 5);
+	}
+	return out;
+}
+
+static string FormatUUID(const uint8_t *bytes) {
+	static const char *HEX = "0123456789abcdef";
+	string out;
+	for (idx_t i = 0; i < 16; i++) {
+		if (i == 4 || i == 6 || i == 8 || i == 10) {
+			out += '-';
+		}
+		out += HEX[bytes[i] >> 4];
+		out += HEX[bytes[i] & 0xF];
+	}
+	return out;
+}
+
+// Fills TEMP table table_deletion_vectors(data_file_id, ...) from the active DuckLake delete files and the inlined
+// deletes, writing one deletion_vector_<uuid>.bin per table into its root. dv_files receives table_id -> file path.
+static void BuildDeletionVectors(Connection &conn, FileSystem &fs, const MetadataLocation &meta,
+                                 std::map<int64_t, string> &dv_files) {
+	ExecuteSQL(conn, "CREATE OR REPLACE TEMP TABLE table_deletion_vectors (data_file_id BIGINT, storage_type VARCHAR, "
+	                 "path_or_inline_dv VARCHAR, dv_offset INTEGER, size_in_bytes INTEGER, cardinality BIGINT);");
+
+	std::map<int64_t, string> roots;
+	auto tables = ExecuteSQL(conn, "SELECT table_id, table_root FROM export_summary WHERE status = 'needs_export'");
+	for (idx_t i = 0; i < tables->RowCount(); i++) {
+		roots[tables->GetValue(0, i).GetValue<int64_t>()] = tables->GetValue(1, i).ToString();
+	}
+
+	// table_id -> data_file_id -> deleted row positions within the data file
+	std::map<int64_t, std::map<int64_t, vector<uint64_t>>> deletes;
+	auto delete_files = ExecuteSQL(conn, QualifyMetadataTables(SQL_GET_DELETE_FILES, meta));
+	for (idx_t i = 0; i < delete_files->RowCount(); i++) {
+		auto table_id = delete_files->GetValue(0, i).GetValue<int64_t>();
+		auto data_file_id = delete_files->GetValue(1, i).GetValue<int64_t>();
+		auto path = delete_files->GetValue(2, i).ToString();
+		auto positions = ExecuteSQL(conn, "SELECT pos FROM read_parquet('" + EscapeSqlString(path) + "')");
+		auto &target = deletes[table_id][data_file_id];
+		for (idx_t r = 0; r < positions->RowCount(); r++) {
+			target.push_back(positions->GetValue(0, r).GetValue<uint64_t>());
+		}
+	}
+	// Deletes DuckLake keeps in the metadata catalog until ducklake_flush_inlined_data; row_id is the file position
+	for (auto &root : roots) {
+		auto tid = std::to_string(root.first);
+		auto inlined = conn.Query(QualifyMetadataTables(
+		    "SELECT d.file_id, d.row_id FROM {META}ducklake_inlined_delete_" + tid +
+		        " d JOIN {META}ducklake_data_file df ON df.data_file_id = d.file_id WHERE df.table_id = " + tid +
+		        " AND df.end_snapshot IS NULL",
+		    meta));
+		if (inlined->HasError()) {
+			if (inlined->GetErrorType() == ExceptionType::CATALOG) {
+				continue; // the table never had inlined deletes
+			}
+			throw InvalidInputException("Delta export failed: %s", inlined->GetError());
+		}
+		for (idx_t r = 0; r < inlined->RowCount(); r++) {
+			deletes[root.first][inlined->GetValue(0, r).GetValue<int64_t>()].push_back(
+			    inlined->GetValue(1, r).GetValue<uint64_t>());
+		}
+	}
+	if (deletes.empty()) {
+		return;
+	}
+
+	auto insert = conn.Prepare("INSERT INTO table_deletion_vectors VALUES ($1, 'u', $2, $3, $4, $5)");
+	if (insert->HasError()) {
+		throw InvalidInputException("Delta export failed: %s", insert->GetError());
+	}
+	RandomEngine random;
+	for (auto &table : deletes) {
+		auto &table_root = roots[table.first];
+		uint8_t uuid[16];
+		for (idx_t i = 0; i < 16; i += 4) {
+			auto r = random.NextRandomInteger();
+			memcpy(uuid + i, &r, 4);
+		}
+		uuid[6] = (uuid[6] & 0x0F) | 0x40; // version 4
+		uuid[8] = (uuid[8] & 0x3F) | 0x80; // RFC 4122 variant
+		auto path_or_inline_dv = Z85Encode(uuid, 16);
+
+		struct Entry {
+			int64_t data_file_id;
+			idx_t offset;
+			idx_t size;
+			idx_t cardinality;
+		};
+		vector<Entry> entries;
+		string file(1, '\x01');
+		for (auto &data_file : table.second) {
+			auto &positions = data_file.second;
+			std::sort(positions.begin(), positions.end());
+			positions.erase(std::unique(positions.begin(), positions.end()), positions.end());
+			if (positions.empty()) {
+				continue;
+			}
+			auto bitmap = SerializeDeletionVector(positions);
+			// offset points at the size prefix of this vector
+			entries.push_back(Entry {data_file.first, file.size(), bitmap.size(), positions.size()});
+			AppendBE32(file, static_cast<uint32_t>(bitmap.size()));
+			file += bitmap;
+			AppendBE32(file, Crc32(bitmap));
+		}
+		if (entries.empty()) {
+			continue;
+		}
+
+		auto dv_path = table_root + "/deletion_vector_" + FormatUUID(uuid) + ".bin";
+		if (!IsRemotePath(table_root) && !fs.DirectoryExists(table_root)) {
+			fs.CreateDirectoriesRecursive(table_root);
+		}
+		{
+			auto handle = fs.OpenFile(dv_path, FileFlags::FILE_FLAGS_WRITE | FileFlags::FILE_FLAGS_FILE_CREATE_NEW);
+			handle->Write(&file[0], file.size());
+			handle->Close();
+		}
+		dv_files[table.first] = dv_path;
+
+		for (auto &entry : entries) {
+			auto result = insert->Execute(Value::BIGINT(entry.data_file_id), Value(path_or_inline_dv),
+			                              Value::INTEGER(NumericCast<int32_t>(entry.offset)),
+			                              Value::INTEGER(NumericCast<int32_t>(entry.size)),
+			                              Value::BIGINT(NumericCast<int64_t>(entry.cardinality)));
+			if (result->HasError()) {
+				throw InvalidInputException("Delta export failed: %s", result->GetError());
+			}
+		}
+	}
+}
+
+// Deletion vector files of earlier exports are no longer referenced once the new checkpoint is written
+static void RemoveStaleDeletionVectors(FileSystem &fs, const string &table_root, const string &keep) {
+	auto keep_name = keep.empty() ? string() : BaseName(keep);
+	for (auto &file : GlobOrEmpty(fs, table_root + "/deletion_vector_*.bin")) {
+		if (BaseName(file.path) != keep_name) {
+			try {
+				fs.TryRemoveFile(file.path);
+			} catch (std::exception &) {
+				// best effort: a stale file only costs storage
+			}
+		}
+	}
+}
+
+//===--------------------------------------------------------------------===//
+// Helper: remove the Delta logs of tables dropped in DuckLake
+//===--------------------------------------------------------------------===//
+// A log is ours when delta_export wrote its newest commit for this DuckLake schema. Logs written before the schema
+// uuid was recorded are only trusted when the catalog itself still lists the dropped table at that root.
+static bool IsOwnedDeltaLog(const string &commit, const string &schema_uuid, bool listed_in_catalog) {
+	if (!StringUtil::Contains(commit, "\"engineInfo\":\"DuckLake-Delta-Exporter")) {
+		return false;
+	}
+	if (!StringUtil::Contains(commit, "\"duckLakeSchemaUuid\":")) {
+		return listed_in_catalog;
+	}
+	return !schema_uuid.empty() && StringUtil::Contains(commit, "\"duckLakeSchemaUuid\":\"" + schema_uuid + "\"");
+}
+
+static void RemoveDeltaLog(FileSystem &fs, const string &table_root) {
+	auto delta_log = table_root + "/_delta_log";
+	for (auto &file : fs.Glob(delta_log + "/*")) {
+		if (!FileSystem::IsDirectory(file)) {
+			fs.RemoveFile(file.path);
+		}
+	}
+	for (auto &file : fs.Glob(table_root + "/deletion_vector_*.bin")) {
+		fs.RemoveFile(file.path);
+	}
+	if (!IsRemotePath(table_root) && fs.DirectoryExists(delta_log)) {
+		fs.RemoveDirectory(delta_log);
+	}
+}
+
+// Adds one export_summary row per removed (or failed) log. Candidates are dropped ducklake_table rows plus
+// exported logs under this catalog's schema folders whose table is gone (its rows may be expired already).
+static void RemoveDroppedTableLogs(Connection &conn, FileSystem &fs) {
+	std::set<string> live_roots;
+	auto live = ExecuteSQL(conn, "SELECT table_root FROM export_summary WHERE table_root IS NOT NULL");
+	for (idx_t i = 0; i < live->RowCount(); i++) {
+		live_roots.insert(NormalizePath(live->GetValue(0, i).ToString()));
+	}
+
+	struct DroppedTable {
+		string table_root;
+		Value table_id;
+		string schema_name;
+		string table_name;
+		string schema_uuid;
+		bool listed_in_catalog;
+	};
+	std::map<string, DroppedTable> candidates;
+	auto dropped = ExecuteSQL(conn, SQL_GET_DROPPED_TABLES);
+	for (idx_t i = 0; i < dropped->RowCount(); i++) {
+		auto root = dropped->GetValue(0, i).ToString();
+		auto key = NormalizePath(root);
+		if (live_roots.count(key)) {
+			continue;
+		}
+		auto schema_uuid = dropped->GetValue(4, i);
+		candidates[key] = DroppedTable {root,
+		                                dropped->GetValue(1, i),
+		                                dropped->GetValue(2, i).ToString(),
+		                                dropped->GetValue(3, i).ToString(),
+		                                schema_uuid.IsNull() ? string() : schema_uuid.ToString(),
+		                                true};
+	}
+	auto schemas =
+	    ExecuteSQL(conn, "SELECT DISTINCT schema_name, schema_uuid, schema_root FROM schema_roots "
+	                     "WHERE schema_root IS NOT NULL AND schema_uuid IS NOT NULL");
+	const string checkpoint_suffix = "/_delta_log/_last_checkpoint";
+	for (idx_t i = 0; i < schemas->RowCount(); i++) {
+		auto schema_root = schemas->GetValue(2, i).ToString();
+		for (auto &hit : GlobOrEmpty(fs, schema_root + "/*" + checkpoint_suffix)) {
+			auto path = NormalizePath(hit.path);
+			if (!StringUtil::EndsWith(path, checkpoint_suffix)) {
+				continue;
+			}
+			auto root = path.substr(0, path.size() - checkpoint_suffix.size());
+			if (live_roots.count(root) || candidates.count(root)) {
+				continue;
+			}
+			candidates[root] = DroppedTable {root,
+			                                 Value(LogicalType::BIGINT),
+			                                 schemas->GetValue(0, i).ToString(),
+			                                 BaseName(root),
+			                                 schemas->GetValue(1, i).ToString(),
+			                                 false};
+		}
+	}
+	if (candidates.empty()) {
+		return;
+	}
+
+	auto insert = conn.Prepare("INSERT INTO export_summary VALUES ($1, $2, $3, $4, $5, NULL, $6, NULL, $7)");
+	if (insert->HasError()) {
+		throw InvalidInputException("Delta export failed: %s", insert->GetError());
+	}
+	for (auto &entry : candidates) {
+		auto &table = entry.second;
+		auto delta_log = table.table_root + "/_delta_log";
+		// newest commit file decides ownership
+		string newest_commit;
+		int64_t newest_version = -1;
+		for (auto &file : GlobOrEmpty(fs, delta_log + "/*.json")) {
+			auto version = DeltaVersionOf(BaseName(file.path));
+			if (version > newest_version) {
+				newest_version = version;
+				newest_commit = file.path;
+			}
+		}
+		if (newest_commit.empty()) {
+			continue;
+		}
+		auto commit = conn.Query("SELECT content FROM read_text('" + EscapeSqlString(newest_commit) + "')");
+		if (commit->HasError() || commit->RowCount() == 0 ||
+		    !IsOwnedDeltaLog(commit->GetValue(0, 0).ToString(), table.schema_uuid, table.listed_in_catalog)) {
+			continue;
+		}
+
+		string status = "removed_dropped";
+		string message = "Removed " + delta_log;
+		try {
+			RemoveDeltaLog(fs, table.table_root);
+		} catch (std::exception &ex) {
+			status = "remove_failed";
+			message = ErrorData(ex).Message();
+		}
+		auto result = insert->Execute(table.table_id, Value(table.schema_name), Value(table.table_name),
+		                              Value(table.table_root), Value(status), Value(message),
+		                              table.schema_uuid.empty() ? Value() : Value(table.schema_uuid));
+		if (result->HasError()) {
+			throw InvalidInputException("Delta export failed: %s", result->GetError());
+		}
+	}
+}
+
 struct DeltaExportBindData : public TableFunctionData {};
 
 struct DeltaExportGlobalState : public GlobalTableFunctionState {
@@ -935,18 +1527,23 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 
 	// Step 1: Build export summary (reads ducklake_* tables)
 	ExecuteSQL(conn, SQL_CREATE_EXPORT_SUMMARY);
+	ExecuteSQL(conn, QualifyMetadataTables(SQL_CREATE_TABLE_ROOTS, meta));
 	ExecuteSQL(conn, QualifyMetadataTables(SQL_INSERT_EXPORT_SUMMARY, meta));
 
 	// Step 2: Build the Delta schema of every exported table (nested types, nulls_allowed)
 	BuildTableSchemas(conn, meta);
 
-	// Step 3: Generate checkpoint parquet data (reads ducklake_* tables)
+	// Step 3: Turn DuckLake delete files and inlined deletes into Delta deletion vectors
+	// The client file system carries the secrets of the session (S3, Azure, ...)
+	auto &fs = FileSystem::GetFileSystem(context);
+	std::map<int64_t, string> dv_files;
+	BuildDeletionVectors(conn, fs, meta, dv_files);
+
+	// Step 4: Generate checkpoint parquet data (reads ducklake_* tables)
 	ExecuteSQL(conn, QualifyMetadataTables(SQL_CREATE_CHECKPOINT_PARQUET, meta));
 
-	// Step 4: Generate JSON checkpoint
+	// Step 5: Generate JSON commit and last checkpoint data
 	ExecuteSQL(conn, SQL_CREATE_CHECKPOINT_JSON);
-
-	// Step 5: Generate last checkpoint
 	ExecuteSQL(conn, SQL_CREATE_LAST_CHECKPOINT);
 
 	// Step 6: Build export paths
@@ -954,7 +1551,6 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 
 	// Step 7: Create _delta_log directories for local paths
 	auto dirs_result = ExecuteSQL(conn, SQL_GET_LOCAL_DIRS);
-	auto &fs = context.db->GetFileSystem();
 	for (idx_t i = 0; i < dirs_result->RowCount(); i++) {
 		string dir_path = dirs_result->GetValue(0, i).ToString();
 		std::replace(dir_path.begin(), dir_path.end(), '\\', '/');
@@ -966,13 +1562,21 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 
 	for (idx_t i = 0; i < exports_result->RowCount(); i++) {
 		int64_t table_id = exports_result->GetValue(1, i).GetValue<int64_t>();
+		string table_root = exports_result->GetValue(2, i).ToString();
 		int64_t snapshot_id = exports_result->GetValue(3, i).GetValue<int64_t>();
-		string checkpoint_file = exports_result->GetValue(4, i).ToString();
-		string json_file = exports_result->GetValue(5, i).ToString();
-		string last_checkpoint_file = exports_result->GetValue(6, i).ToString();
+		string delta_log = exports_result->GetValue(4, i).ToString();
+
+		// The Delta version follows the DuckLake snapshot, but must stay above anything already in the folder: a
+		// replaced table or a recreated catalog can restart below an older log, and readers would keep using it.
+		auto existing_version = ExistingMaxDeltaVersion(fs, delta_log);
+		int64_t version = existing_version > snapshot_id ? existing_version + 1 : snapshot_id;
+		string checkpoint_file = DeltaLogFile(delta_log, version, ".checkpoint.parquet");
+		string json_file = DeltaLogFile(delta_log, version, ".json");
+		string last_checkpoint_file = delta_log + "/_last_checkpoint";
 
 		string tid = std::to_string(table_id);
 		string sid = std::to_string(snapshot_id);
+		string ver = std::to_string(version);
 
 		string copy_parquet = "COPY (SELECT protocol, metaData, add, remove, commitInfo "
 		                      "FROM temp_checkpoint_parquet "
@@ -991,16 +1595,23 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 		                   json_file + "' (FORMAT CSV, HEADER false, QUOTE '');";
 		ExecuteSQL(conn, copy_json);
 
-		string copy_last = "COPY (SELECT content FROM temp_last_checkpoint "
+		string copy_last = "COPY (SELECT '{\"version\":" + ver +
+		                   ",\"size\":' || size || '}' AS content FROM temp_last_checkpoint "
 		                   "WHERE table_id = " +
 		                   tid + " AND snapshot_id = " + sid +
 		                   ") "
 		                   "TO '" +
 		                   last_checkpoint_file + "' (FORMAT CSV, HEADER false, QUOTE '');";
 		ExecuteSQL(conn, copy_last);
+
+		auto dv_file = dv_files.find(table_id);
+		RemoveStaleDeletionVectors(fs, table_root, dv_file == dv_files.end() ? string() : dv_file->second);
 	}
 
-	// Step 9: Collect and return results
+	// Step 9: Remove the Delta logs of tables dropped in DuckLake
+	RemoveDroppedTableLogs(conn, fs);
+
+	// Step 10: Collect and return results
 	auto summary_result = ExecuteSQL(conn, SQL_GET_EXPORT_SUMMARY);
 
 	for (idx_t i = 0; i < summary_result->RowCount(); i++) {
@@ -1037,7 +1648,18 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction func("delta_export", {}, DeltaExportScan, DeltaExportBind);
 	func.init_global = DeltaExportGlobalInit;
-	loader.RegisterFunction(func);
+
+	CreateTableFunctionInfo info(func);
+	FunctionDescription desc;
+	desc.description = "Exports every table of the DuckLake catalog in use (or the first attached lake) to Delta Lake "
+	                   "by writing _delta_log metadata over the existing parquet files, with deletes as deletion "
+	                   "vectors; also removes the Delta logs of dropped tables. Returns one status row per table.";
+	desc.examples = {"CALL delta_export();", "SELECT table_name, status, data_snapshot FROM delta_export();"};
+	desc.categories = {"ducklake", "delta", "export"};
+	info.descriptions.push_back(std::move(desc));
+	// what the bare RegisterFunction(TableFunction) overload does internally
+	info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	loader.RegisterFunction(std::move(info));
 }
 
 void DeltaExportExtension::Load(ExtensionLoader &loader) {

@@ -28,6 +28,8 @@ The function returns a summary table showing the export status of each table:
 
 - **needs_export** — data was exported to Delta format
 - **no_data_files** — table has no parquet files (empty table, skipped)
+- **removed_dropped** — the table was dropped in DuckLake and the Delta log delta_export had written for it was removed
+- **remove_failed** — same, but removing the log failed; `message` has the error
 
 ### Python
 
@@ -47,6 +49,9 @@ con.sql("""
 
 - **Metadata-only export** — writes Delta Lake metadata on top of existing DuckLake Parquet files, no data copying
 - **Column statistics** — generates Delta checkpoint files with min/max/null_count stats
+- **Deletes without rewriting** — DuckLake delete files (and inlined deletes) are exported as Delta deletion vectors, so `DELETE`, `UPDATE` and `MERGE` read back correctly without `ducklake_rewrite_data_files`. Tables with deletes use Delta protocol reader 3 / writer 7 (`deletionVectors`); others stay on 1 / 2
+- **Dropped tables** — after `DROP TABLE`, the next export removes that table's `_delta_log` so Delta readers stop seeing it. Only logs delta_export wrote for the same DuckLake schema are touched; the parquet files are left to DuckLake's own cleanup
+- **Replaced tables** — the Delta version follows the DuckLake snapshot but always moves past an existing log, so `CREATE OR REPLACE TABLE` or a recreated catalog over the same folder is read correctly
 - **Type mappings** — maps DuckLake types to Delta Lake schema types, including nested `LIST`, `STRUCT` and `MAP` columns; `NOT NULL` columns are exported as non-nullable
 - **Absolute paths** — honours DuckLake's `path_is_relative` flag on schemas, tables and data files (for example files registered with `ducklake_add_data_files` from outside the data path)
 - **Any storage backend** — supports any storage DuckDB supports: local filesystem, S3, Azure (abfss://), GCS
@@ -72,14 +77,14 @@ con.sql("""
 2. Generates Delta Lake checkpoint files (`.checkpoint.parquet`, `.json`, `_last_checkpoint`) in each table's `_delta_log/` directory
 3. Other engines (Spark, Databricks, Fabric, Trino, etc.) can then read the same Parquet files via the Delta protocol
 
-**Important**: Before running `delta_export`, make sure to flush inlined data and rewrite files with deletes:
+**Important**: inserted rows still inlined in the metadata catalog are not in any parquet file, so flush them before exporting:
 
 ```sql
 CALL ducklake_flush_inlined_data('my_catalog');
-CALL my_catalog.set_option('rewrite_delete_threshold', 0);
-CALL ducklake_rewrite_data_files('my_catalog');
 CALL delta_export();
 ```
+
+Rewriting files with deletes (`ducklake_rewrite_data_files`) is no longer required; it only lets the export drop the deletion vectors. Deletion vector files (`deletion_vector_*.bin`) and `_delta_log` live in the table folders but DuckLake does not track them, so `ducklake_delete_orphaned_files` removes them. If you run it, run `delta_export` again afterwards.
 
 ## Real-world example
 
