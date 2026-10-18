@@ -1,4 +1,6 @@
 import os
+import time
+
 import pytest
 import duckdb
 
@@ -14,14 +16,20 @@ def spark():
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
 
+    # PySpark turns timestamps into Python datetimes in the process time zone
+    os.environ["TZ"] = "UTC"
+    time.tzset()
     builder = (
-        SparkSession.builder.master("local[1]")
+        SparkSession.builder.master("local[2]")
         .appName("delta_export_oracle")
         .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
         .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
         .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.sql.shuffle.partitions", "2")
         .config("spark.ui.enabled", "false")
+        # the default, set explicitly: filters must go through data skipping on the exported stats
+        .config("spark.databricks.delta.stats.skipping", "true")
+        .config("spark.driver.memory", "4g")
     )
     session = configure_spark_with_delta_pip(builder).getOrCreate()
     yield session

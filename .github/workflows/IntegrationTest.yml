@@ -8,6 +8,13 @@ on:
     paths:
       - 'test/python/**'
   workflow_dispatch:
+    inputs:
+      fuzz_seeds:
+        description: 'Number of fuzz seeds (0..n-1)'
+        default: '30'
+      fuzz_seed:
+        description: 'Replay a single fuzz seed (overrides fuzz_seeds)'
+        default: ''
 
 permissions:
   contents: read
@@ -51,15 +58,17 @@ jobs:
           DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
 
   spark-tests:
-    name: Spark reader tests
+    name: Spark (Fabric Runtime 2.0)
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
+      # Fabric Runtime 2.0: Spark 4.1, Delta Lake 4.2, Java 21, Python 3.13
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.13'
 
       - name: Download extension artifact
         uses: dawidd6/action-download-artifact@v6
@@ -82,19 +91,23 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
-      - run: pip install duckdb==1.5.5 pyspark==3.5.3 delta-spark==3.2.1 pyarrow pytest
+      - run: pip install duckdb==1.5.5 pyspark==4.1.3 delta-spark==4.2.0 pyarrow pytest
 
-      # Spark + Delta Lake is the reference reader
-      - run: pytest test/python/test_spark_oracle.py -v -s --tb=long -m spark
+      # Spark + Delta Lake is the reference reader: smoke suite, edge cases, randomized workloads
+      - run: pytest test/python/ -v -s --tb=long -m spark
         env:
           DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
+          FUZZ_SEEDS: ${{ inputs.fuzz_seeds || '30' }}
+          FUZZ_SEED: ${{ inputs.fuzz_seed }}
 
   onelake-tests:
     # Live OneLake round trip. Auth is GitHub OIDC only: the test exchanges the job's id-token for a
-    # storage token (workload-identity federation, no client secret, no az login).
-    name: OneLake tests
+    # storage token (workload-identity federation, no client secret, no az login). Runs last: the final
+    # check is the Fabric SQL analytics endpoint reading the exported tables.
+    name: OneLake + SQL endpoint
+    needs: spark-tests
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
@@ -130,7 +143,7 @@ jobs:
           path: ./artifact
           search_artifacts: true
 
-      - run: pip install duckdb==1.5.5 azure-identity pytest
+      - run: pip install duckdb==1.5.5 azure-identity mssql-python pytest
 
       - run: pytest test/python/test_onelake.py -v -s --tb=long
         env:

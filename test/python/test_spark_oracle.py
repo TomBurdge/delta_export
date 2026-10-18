@@ -115,7 +115,11 @@ def test_spark_partitioned_table(spark, ducklake_env):
 
 
 def test_spark_rename_drop_add_column(spark, ducklake_env):
-    """Part of the issue #5 test_customers shape: renamed, dropped and added columns plus partition evolution."""
+    """Part of the issue #5 test_customers shape: renamed, dropped and added columns plus partition evolution.
+
+    Files written before the rename keep the old name. Readers that resolve columns by name, like the Fabric
+    SQL analytics endpoint, would read NULL, so the table is reported needs_rewrite until it is rewritten.
+    """
     conn, data_path = ducklake_env
     conn.execute("CREATE TABLE customers (id INTEGER, name VARCHAR, city VARCHAR)")
     conn.execute("INSERT INTO customers SELECT i, 'c' || i, ['a', 'b'][i % 2 + 1] FROM range(500) t(i)")
@@ -125,6 +129,10 @@ def test_spark_rename_drop_add_column(spark, ducklake_env):
     conn.execute("ALTER TABLE customers ADD COLUMN tier VARCHAR")
     conn.execute("ALTER TABLE customers SET PARTITIONED BY (tier)")
     conn.execute("INSERT INTO customers SELECT i, 'c' || i, 'gold' FROM range(500, 600) t(i)")
+    rows = _export(conn)
+    assert [(r[0], r[1]) for r in rows] == [("main.customers", "needs_rewrite")]
+
+    conn.execute("CREATE OR REPLACE TABLE customers AS SELECT * FROM customers")
     _export(conn)
     root = find_delta_roots(data_path)["customers"]
     _assert_spark_matches(spark, conn, "customers", root, ["id", "full_name", "tier"], "id")
