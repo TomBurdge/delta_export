@@ -28,8 +28,21 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      # DuckDB itself is most of the build; ccache keeps its objects between runs so a change to the
+      # extension only recompiles the extension
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build
+
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-amd64-duckdb-v1.5.5
+          max-size: 2G
+
       - name: Build extension
         run: make release
+        env:
+          GEN: ninja
+          CMAKE_C_COMPILER_LAUNCHER: ccache
+          CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
       - uses: actions/upload-artifact@v4
         with:

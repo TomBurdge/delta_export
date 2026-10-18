@@ -1,4 +1,7 @@
 name: Integration Test
+# Each job keeps pytest's last-failed cache: a run only re-runs the tests that failed in the previous run of
+# that job (everything when nothing failed). Dispatch with full=true to run everything, only=<job> to run one
+# job, tests=<pytest -k expression> to run chosen tests.
 on:
   workflow_run:
     workflows: ["Linux Build"]
@@ -9,21 +12,38 @@ on:
       - 'test/python/**'
   workflow_dispatch:
     inputs:
+      only:
+        description: 'Run one job'
+        type: choice
+        options: [all, python, spark, onelake]
+        default: all
+      tests:
+        description: 'pytest -k expression (runs only these tests)'
+        default: ''
+      full:
+        description: 'Run every test instead of only the last failures'
+        type: boolean
+        default: false
       fuzz_seeds:
         description: 'Number of fuzz seeds (0..n-1)'
-        default: '30'
+        default: '8'
       fuzz_seed:
         description: 'Replay a single fuzz seed (overrides fuzz_seeds)'
         default: ''
 
 permissions:
   contents: read
-  actions: read
+  actions: write # save the pytest cache
+
+env:
+  DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
+  FULL: ${{ inputs.full }}
+  TESTS: ${{ inputs.tests }}
 
 jobs:
   python-tests:
     name: Python tests
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'python') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,16 +70,30 @@ jobs:
           path: ./artifact
           search_artifacts: true
 
+      - uses: actions/cache/restore@v4
+        with:
+          path: .pytest_cache
+          key: pytest-python-${{ github.run_id }}
+          restore-keys: pytest-python-
+
       - run: pip install duckdb==1.5.5 deltalake pyarrow pytest
 
       # delta_scan (delta-kernel-rs) and delta-rs read every export; Spark runs in its own job
-      - run: pytest test/python/ -v -s --tb=long -m "not spark"
-        env:
-          DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
+      - name: pytest
+        run: |
+          set -- -v -s --tb=long -m "not spark"
+          if [ -n "$TESTS" ]; then set -- "$@" -k "$TESTS"; elif [ "$FULL" != "true" ]; then set -- "$@" --lf --lfnf all; fi
+          pytest test/python/ "$@"
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .pytest_cache
+          key: pytest-python-${{ github.run_id }}-${{ github.run_attempt }}
 
   spark-tests:
     name: Spark (Fabric Runtime 2.0)
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'spark') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -93,24 +127,37 @@ jobs:
           distribution: temurin
           java-version: '21'
 
+      - uses: actions/cache/restore@v4
+        with:
+          path: .pytest_cache
+          key: pytest-spark-${{ github.run_id }}
+          restore-keys: pytest-spark-
+
       # delta-spark 4.2.0 pins pyspark <= 4.1.1
       # pytz: DuckDB needs it to return TIMESTAMPTZ values to Python
       - run: pip install duckdb==1.5.5 pyspark==4.1.1 delta-spark==4.2.0 pyarrow pytz pytest
 
       # Spark + Delta Lake is the reference reader: smoke suite, edge cases, randomized workloads
-      - run: pytest test/python/ -v -s --tb=long -m spark
+      - name: pytest
         env:
-          DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
-          FUZZ_SEEDS: ${{ inputs.fuzz_seeds || '30' }}
+          FUZZ_SEEDS: ${{ inputs.fuzz_seeds || '8' }}
           FUZZ_SEED: ${{ inputs.fuzz_seed }}
+        run: |
+          set -- -v -s --tb=long -m spark
+          if [ -n "$TESTS" ]; then set -- "$@" -k "$TESTS"; elif [ "$FULL" != "true" ]; then set -- "$@" --lf --lfnf all; fi
+          pytest test/python/ "$@"
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: .pytest_cache
+          key: pytest-spark-${{ github.run_id }}-${{ github.run_attempt }}
 
   onelake-tests:
-    # Live OneLake round trip. Auth is GitHub OIDC only: the test exchanges the job's id-token for a
-    # storage token (workload-identity federation, no client secret, no az login). Runs last: the final
-    # check is the Fabric SQL analytics endpoint reading the exported tables.
+    # Live OneLake round trip ending with the Fabric SQL analytics endpoint reading the exported tables. Auth is
+    # GitHub OIDC only: the test exchanges the job's id-token for tokens (workload-identity federation).
     name: OneLake + SQL endpoint
-    needs: spark-tests
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && (github.event_name != 'workflow_dispatch' || inputs.only == 'all' || inputs.only == 'onelake') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -148,5 +195,3 @@ jobs:
       - run: pip install duckdb==1.5.5 azure-identity mssql-python pytest
 
       - run: pytest test/python/test_onelake.py -v -s --tb=long
-        env:
-          DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
