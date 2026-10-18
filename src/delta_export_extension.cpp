@@ -242,7 +242,9 @@ file_column_stats_transformed AS (
                     '^([^.]+)$', '\1.000'
                 ) || 'Z'
             WHEN contains(lower(fca.column_type), 'date') THEN fca.min_value
-            WHEN contains(lower(fca.column_type), 'bool') THEN CAST(lower(fca.min_value) IN ('true', 't', '1', 'yes') AS VARCHAR)
+            -- min/max are emitted as JSON strings; delta-kernel rejects a string for a boolean, and Delta writers
+            -- do not collect boolean bounds anyway
+            WHEN contains(lower(fca.column_type), 'bool') THEN NULL
             WHEN contains(lower(fca.column_type), 'int') OR contains(lower(fca.column_type), 'float')
                  OR contains(lower(fca.column_type), 'double') OR contains(lower(fca.column_type), 'decimal') THEN
                 CASE WHEN contains(fca.min_value, '.') OR contains(lower(fca.min_value), 'e')
@@ -259,7 +261,7 @@ file_column_stats_transformed AS (
                     '^([^.]+)$', '\1.000'
                 ) || 'Z'
             WHEN contains(lower(fca.column_type), 'date') THEN fca.max_value
-            WHEN contains(lower(fca.column_type), 'bool') THEN CAST(lower(fca.max_value) IN ('true', 't', '1', 'yes') AS VARCHAR)
+            WHEN contains(lower(fca.column_type), 'bool') THEN NULL
             WHEN contains(lower(fca.column_type), 'int') OR contains(lower(fca.column_type), 'float')
                  OR contains(lower(fca.column_type), 'double') OR contains(lower(fca.column_type), 'decimal') THEN
                 CASE WHEN contains(fca.max_value, '.') OR contains(lower(fca.max_value), 'e')
@@ -1521,6 +1523,10 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 	// ── Run export on the current database ──
 	// Use a separate Connection to avoid deadlocking context.Query() inside a scan
 	Connection conn(*context.db);
+	// A new connection starts from the global settings only: carry over the caller's session-level SETs, such as
+	// azure_transport_option_type = 'curl', which OneLake needs on Linux to read delete files and write the log
+	conn.context->config.user_settings = context.config.user_settings;
+	conn.context->config.user_variables = context.config.user_variables;
 	// Locate the DuckLake metadata catalog from the main context — works with USE, dbt (no USE), a hidden
 	// metadata catalog (DuckLake on DuckDB >= 1.5.3), METADATA_CATALOG / METADATA_SCHEMA, or a direct attach
 	auto meta = ResolveMetadataLocation(context);

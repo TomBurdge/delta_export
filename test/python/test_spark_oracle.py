@@ -114,21 +114,33 @@ def test_spark_partitioned_table(spark, ducklake_env):
     _assert_spark_matches(spark, conn, "sales", root, ["id", "region", "amount", "note"], "id")
 
 
-def test_spark_schema_evolution(spark, ducklake_env):
-    """The issue #5 test_customers shape: renamed, dropped and widened columns plus partition evolution."""
+def test_spark_rename_drop_add_column(spark, ducklake_env):
+    """Part of the issue #5 test_customers shape: renamed, dropped and added columns plus partition evolution."""
     conn, data_path = ducklake_env
-    conn.execute("CREATE TABLE customers (id INTEGER, name VARCHAR, city VARCHAR, score INTEGER)")
-    conn.execute("INSERT INTO customers SELECT i, 'c' || i, ['a', 'b'][i % 2 + 1], i FROM range(500) t(i)")
+    conn.execute("CREATE TABLE customers (id INTEGER, name VARCHAR, city VARCHAR)")
+    conn.execute("INSERT INTO customers SELECT i, 'c' || i, ['a', 'b'][i % 2 + 1] FROM range(500) t(i)")
     conn.execute("CALL ducklake_flush_inlined_data('test_lake')")
     conn.execute("ALTER TABLE customers RENAME COLUMN name TO full_name")
     conn.execute("ALTER TABLE customers DROP COLUMN city")
-    conn.execute("ALTER TABLE customers ALTER COLUMN score TYPE BIGINT")
     conn.execute("ALTER TABLE customers ADD COLUMN tier VARCHAR")
     conn.execute("ALTER TABLE customers SET PARTITIONED BY (tier)")
-    conn.execute("INSERT INTO customers SELECT i, 'c' || i, i * 1000000000, 'gold' FROM range(500, 600) t(i)")
+    conn.execute("INSERT INTO customers SELECT i, 'c' || i, 'gold' FROM range(500, 600) t(i)")
     _export(conn)
     root = find_delta_roots(data_path)["customers"]
-    _assert_spark_matches(spark, conn, "customers", root, ["id", "full_name", "score", "tier"], "id")
+    _assert_spark_matches(spark, conn, "customers", root, ["id", "full_name", "tier"], "id")
+
+
+def test_spark_type_widening(spark, ducklake_env):
+    """The other part of test_customers: INTEGER widened to BIGINT, old files still hold INT32."""
+    conn, data_path = ducklake_env
+    conn.execute("CREATE TABLE scores (id INTEGER, score INTEGER)")
+    conn.execute("INSERT INTO scores SELECT i, i FROM range(500) t(i)")
+    conn.execute("CALL ducklake_flush_inlined_data('test_lake')")
+    conn.execute("ALTER TABLE scores ALTER COLUMN score TYPE BIGINT")
+    conn.execute("INSERT INTO scores SELECT i, i * 1000000000 FROM range(500, 600) t(i)")
+    _export(conn)
+    root = find_delta_roots(data_path)["scores"]
+    _assert_spark_matches(spark, conn, "scores", root, ["id", "score"], "id")
 
 
 def test_spark_nested_types(spark, ducklake_env):

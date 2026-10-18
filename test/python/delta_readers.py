@@ -21,7 +21,9 @@ def _delta_rs_query(root, sql):
     from deltalake import DeltaTable, QueryBuilder
 
     result = QueryBuilder().register("t", DeltaTable(root)).execute(sql)
-    return result.read_all() if hasattr(result, "read_all") else pa.Table.from_batches(result)
+    table = result.read_all() if hasattr(result, "read_all") else pa.Table.from_batches(result)
+    # deltalake 1.x returns arro3 tables; pyarrow reads them through the Arrow C stream interface
+    return table if isinstance(table, pa.Table) else pa.table(table)
 
 
 def delta_rs_count(root):
