@@ -730,6 +730,8 @@ struct MetadataLocation {
 	string catalog;
 	//! Schema holding the ducklake_* tables (METADATA_SCHEMA attach option); empty means the default schema
 	string schema;
+	//! Name of the attached DuckLake catalog; empty when only the metadata database is attached
+	string lake;
 };
 
 // DuckLake (on DuckDB >= 1.5.3) attaches its metadata catalog HIDDEN unless METADATA_CATALOG is given, so
@@ -755,6 +757,7 @@ static MetadataLocation ResolveMetadataLocation(ClientContext &context) {
 		if (db->GetCatalog().GetCatalogType() == "ducklake") {
 			MetadataLocation loc;
 			loc.catalog = "__ducklake_metadata_" + name;
+			loc.lake = name;
 			// ATTACH option keys are lowercased by the parser; DuckLake leaves them in the map
 			auto &options = db->GetAttachOptions();
 			auto catalog_opt = options.find("metadata_catalog");
@@ -810,6 +813,16 @@ static unique_ptr<MaterializedQueryResult> ExecuteSQL(Connection &conn, const st
 		throw InvalidInputException("Delta export failed: %s\nSQL: %s", result->GetError(), sql.substr(0, 200));
 	}
 	return result;
+}
+
+template <class T>
+static T ResultValue(MaterializedQueryResult &result, idx_t col, idx_t row, const char *what) {
+	auto value = result.GetValue(col, row);
+	if (value.IsNull()) {
+		throw InvalidInputException("Delta export failed: unexpected NULL in %s, column %d, row %d", what,
+		                            NumericCast<int64_t>(col), NumericCast<int64_t>(row));
+	}
+	return value.GetValue<T>();
 }
 
 // Keeps a table out of this export; the status and message in the result say why. The first reason wins.
@@ -1108,12 +1121,12 @@ static void BuildTableSchemas(Connection &conn, const MetadataLocation &meta, co
 
 	std::map<int64_t, vector<DuckLakeColumn>> table_columns;
 	for (idx_t i = 0; i < columns_result->RowCount(); i++) {
-		auto table_id = columns_result->GetValue(0, i).GetValue<int64_t>();
+		auto table_id = ResultValue<int64_t>(*columns_result, 0, i, "columns_result");
 		DuckLakeColumn col;
-		col.column_id = columns_result->GetValue(1, i).GetValue<int64_t>();
+		col.column_id = ResultValue<int64_t>(*columns_result, 1, i, "columns_result");
 		col.name = columns_result->GetValue(3, i).ToString();
 		col.type = columns_result->GetValue(4, i).ToString();
-		col.nullable = columns_result->GetValue(5, i).GetValue<bool>();
+		col.nullable = ResultValue<bool>(*columns_result, 5, i, "columns_result");
 		auto parent = columns_result->GetValue(6, i);
 		if (!parent.IsNull()) {
 			col.has_parent = true;
@@ -1412,20 +1425,20 @@ static void BuildDeletionVectors(Connection &conn, FileSystem &fs, const Metadat
 	std::map<int64_t, string> roots;
 	auto tables = ExecuteSQL(conn, "SELECT table_id, table_root FROM export_summary WHERE status = 'needs_export'");
 	for (idx_t i = 0; i < tables->RowCount(); i++) {
-		roots[tables->GetValue(0, i).GetValue<int64_t>()] = tables->GetValue(1, i).ToString();
+		roots[ResultValue<int64_t>(*tables, 0, i, "tables")] = tables->GetValue(1, i).ToString();
 	}
 
 	// table_id -> data_file_id -> deleted row positions within the data file
 	std::map<int64_t, std::map<int64_t, vector<uint64_t>>> deletes;
 	auto delete_files = ExecuteSQL(conn, QualifyMetadataTables(SQL_GET_DELETE_FILES, meta));
 	for (idx_t i = 0; i < delete_files->RowCount(); i++) {
-		auto table_id = delete_files->GetValue(0, i).GetValue<int64_t>();
-		auto data_file_id = delete_files->GetValue(1, i).GetValue<int64_t>();
+		auto table_id = ResultValue<int64_t>(*delete_files, 0, i, "delete_files");
+		auto data_file_id = ResultValue<int64_t>(*delete_files, 1, i, "delete_files");
 		auto path = delete_files->GetValue(2, i).ToString();
 		auto positions = ExecuteSQL(conn, "SELECT pos FROM read_parquet('" + EscapeSqlString(path) + "')");
 		auto &target = deletes[table_id][data_file_id];
 		for (idx_t r = 0; r < positions->RowCount(); r++) {
-			target.push_back(positions->GetValue(0, r).GetValue<uint64_t>());
+			target.push_back(ResultValue<uint64_t>(*positions, 0, r, "positions"));
 		}
 	}
 	// Deletes DuckLake keeps in the metadata catalog until ducklake_flush_inlined_data; row_id is the file position
@@ -1443,8 +1456,8 @@ static void BuildDeletionVectors(Connection &conn, FileSystem &fs, const Metadat
 			throw InvalidInputException("Delta export failed: %s", inlined->GetError());
 		}
 		for (idx_t r = 0; r < inlined->RowCount(); r++) {
-			deletes[root.first][inlined->GetValue(0, r).GetValue<int64_t>()].push_back(
-			    inlined->GetValue(1, r).GetValue<uint64_t>());
+			deletes[root.first][ResultValue<int64_t>(*inlined, 0, r, "inlined")].push_back(
+			    ResultValue<uint64_t>(*inlined, 1, r, "inlined"));
 		}
 	}
 	if (deletes.empty()) {
@@ -1675,8 +1688,8 @@ static WidenedColumns AnalyzeColumnHistory(Connection &conn, const MetadataLocat
 	WidenedColumns widened;
 	auto history = ExecuteSQL(conn, QualifyMetadataTables(SQL_GET_COLUMN_HISTORY, meta));
 	for (idx_t i = 0; i < history->RowCount(); i++) {
-		auto table_id = history->GetValue(0, i).GetValue<int64_t>();
-		auto column_id = history->GetValue(1, i).GetValue<int64_t>();
+		auto table_id = ResultValue<int64_t>(*history, 0, i, "history");
+		auto column_id = ResultValue<int64_t>(*history, 1, i, "history");
 		auto kind = history->GetValue(2, i).ToString();
 		auto detail = history->GetValue(3, i).ToString();
 		auto name = history->GetValue(4, i).ToString();
@@ -1805,6 +1818,12 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 	// metadata catalog (DuckLake on DuckDB >= 1.5.3), METADATA_CATALOG / METADATA_SCHEMA, or a direct attach
 	auto meta = ResolveMetadataLocation(context);
 
+	// Rows DuckLake still keeps inlined in the metadata catalog are in no parquet file, so a Delta reader would
+	// never see them: flush them first. A read-only lake cannot flush; its inlined rows stay out of the export.
+	if (!meta.lake.empty()) {
+		conn.Query("CALL ducklake_flush_inlined_data('" + EscapeSqlString(meta.lake) + "')");
+	}
+
 	// Step 1: Build export summary (reads ducklake_* tables)
 	ExecuteSQL(conn, SQL_CREATE_EXPORT_SUMMARY);
 	ExecuteSQL(conn, QualifyMetadataTables(SQL_CREATE_TABLE_ROOTS, meta));
@@ -1845,9 +1864,9 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 	auto exports_result = ExecuteSQL(conn, SQL_GET_EXPORTS);
 
 	for (idx_t i = 0; i < exports_result->RowCount(); i++) {
-		int64_t table_id = exports_result->GetValue(1, i).GetValue<int64_t>();
+		int64_t table_id = ResultValue<int64_t>(*exports_result, 1, i, "exports_result");
 		string table_root = exports_result->GetValue(2, i).ToString();
-		int64_t snapshot_id = exports_result->GetValue(3, i).GetValue<int64_t>();
+		int64_t snapshot_id = ResultValue<int64_t>(*exports_result, 3, i, "exports_result");
 		string delta_log = exports_result->GetValue(4, i).ToString();
 
 		// The Delta version follows the DuckLake snapshot, but must stay above anything already in the folder: a

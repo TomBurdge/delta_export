@@ -30,6 +30,8 @@ The function returns a summary table showing the export status of each table:
 - **no_data_files** — table has no parquet files (empty table, skipped)
 - **removed_dropped** — the table was dropped in DuckLake and the Delta log delta_export had written for it was removed
 - **remove_failed** — same, but removing the log failed; `message` has the error
+- **needs_rewrite** — not exported: older data files no longer match the schema (rename, drop + re-add); `message` names the column and the fix
+- **unsupported_column_name** — not exported: a column name Delta does not allow without column mapping
 
 ### Python
 
@@ -77,12 +79,9 @@ con.sql("""
 2. Generates Delta Lake checkpoint files (`.checkpoint.parquet`, `.json`, `_last_checkpoint`) in each table's `_delta_log/` directory
 3. Other engines (Spark, Databricks, Fabric, Trino, etc.) can then read the same Parquet files via the Delta protocol
 
-**Important**: inserted rows still inlined in the metadata catalog are not in any parquet file, so flush them before exporting:
+Rows DuckLake still keeps inlined in the metadata catalog are in no parquet file, so `delta_export` flushes them first (`ducklake_flush_inlined_data`). A lake attached read-only cannot be flushed, and its inlined rows stay out of the export.
 
-```sql
-CALL ducklake_flush_inlined_data('my_catalog');
-CALL delta_export();
-```
+Tables whose older data files no longer match the current schema are not exported and are reported as `needs_rewrite`: a renamed column, or a column dropped and added again under the same name. The files keep the old layout, and readers that match columns by name, such as the Fabric SQL analytics endpoint, would read NULLs. Rewrite such a table, e.g. `CREATE OR REPLACE TABLE t AS SELECT * FROM t`. Widened columns (e.g. `INTEGER` to `BIGINT`) are exported with the Delta `typeWidening` feature. Column names containing a character Delta only allows with column mapping (space, `,;{}()=`) are reported as `unsupported_column_name`.
 
 Rewriting files with deletes (`ducklake_rewrite_data_files`) is no longer required; it only lets the export drop the deletion vectors. Deletion vector files (`deletion_vector_*.bin`) and `_delta_log` live in the table folders but DuckLake does not track them, so `ducklake_delete_orphaned_files` removes them. If you run it, run `delta_export` again afterwards.
 

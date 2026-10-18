@@ -94,7 +94,8 @@ jobs:
           java-version: '21'
 
       # delta-spark 4.2.0 pins pyspark <= 4.1.1
-      - run: pip install duckdb==1.5.5 pyspark==4.1.1 delta-spark==4.2.0 pyarrow pytest
+      # pytz: DuckDB needs it to return TIMESTAMPTZ values to Python
+      - run: pip install duckdb==1.5.5 pyspark==4.1.1 delta-spark==4.2.0 pyarrow pytz pytest
 
       # Spark + Delta Lake is the reference reader: smoke suite, edge cases, randomized workloads
       - run: pytest test/python/ -v -s --tb=long -m spark

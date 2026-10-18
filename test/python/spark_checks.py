@@ -129,6 +129,26 @@ def _quote(name):
     return '"' + name.replace('"', '""') + '"'
 
 
+def _spark_col(name):
+    from pyspark.sql import functions as F
+
+    return F.col("`" + name.replace("`", "``") + "`")
+
+
+def _spark_lit(v):
+    """A Spark literal for a value read from DuckDB. Dates and timestamps go through ISO text: py4j formats
+    year 1 as '1-01-01', which java.sql.Date rejects."""
+    from pyspark.sql import functions as F
+
+    if isinstance(v, datetime.datetime):
+        if v.tzinfo:
+            v = v.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+        return F.lit(v.isoformat(sep=" ")).cast("timestamp")
+    if isinstance(v, datetime.date):
+        return F.lit(v.isoformat()).cast("date")
+    return F.lit(v)
+
+
 def _diff(expected, actual, limit=5):
     missing = list((expected - actual).elements())[:limit]
     extra = list((actual - expected).elements())[:limit]
@@ -191,14 +211,15 @@ def assert_export_matches(spark, conn, table, root, rng=None, label=""):
         if len(literals) >= 2:
             predicates.append(("in", literals[:2]))
         for op, v in rng.sample(predicates, min(5, len(predicates))):
-            col = F.col(name)
+            col = _spark_col(name)
             if op == "is_null":
                 duck_where, spark_filter, params = f"{q} IS NULL", col.isNull(), []
             elif op == "in":
-                duck_where, spark_filter, params = f"{q} IN (?, ?)", col.isin(*v), list(v)
+                duck_where, spark_filter, params = f"{q} IN (?, ?)", col.isin(*[_spark_lit(x) for x in v]), list(v)
             else:
                 duck_where = f"{q} {op} ?"
-                spark_filter = {"=": col == F.lit(v), "<": col < F.lit(v), ">": col > F.lit(v)}[op]
+                lit = _spark_lit(v)
+                spark_filter = {"=": col == lit, "<": col < lit, ">": col > lit}[op]
                 params = [v]
             want = conn.execute(f"SELECT count(*) FROM {table} WHERE {duck_where}", params).fetchone()[0]
             got = df.filter(spark_filter).count()
