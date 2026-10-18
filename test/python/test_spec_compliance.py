@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 
+from delta_readers import delta_rs_count
+
 
 def _find_delta_log(data_path):
     for root, dirs, files in os.walk(data_path):
@@ -51,6 +53,7 @@ def test_not_null_column_nullable_false(ducklake_env):
 
     root = os.path.dirname(delta_log)
     assert conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0] == 2
+    assert delta_rs_count(root) == 2
 
 
 def test_nested_types_schema_and_roundtrip(ducklake_env):
@@ -107,6 +110,7 @@ def test_extra_type_mappings(ducklake_env):
     assert types == {"d": "decimal(18,3)", "tz": "timestamp"}
     root = os.path.dirname(delta_log)
     assert conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0] == 1
+    assert delta_rs_count(root) == 1
 
 
 def test_lossy_type_mappings_are_explicit(ducklake_env):
@@ -177,3 +181,4 @@ def test_absolute_table_path(ducklake_env, tmp_path):
     assert os.path.isdir(os.path.join(new_dir, "_delta_log"))
     assert _find_delta_log(data_path) is None
     assert conn.execute(f"SELECT count(*) FROM delta_scan('{new_dir}')").fetchone()[0] == 25
+    assert delta_rs_count(new_dir) == 25

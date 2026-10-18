@@ -3,6 +3,31 @@ import pytest
 import duckdb
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "spark: reads the export with Spark + Delta Lake (spark-tests CI job)")
+
+
+@pytest.fixture(scope="session")
+def spark():
+    """Local Spark with Delta Lake: the reference Delta reader. Skips when pyspark is not installed."""
+    pytest.importorskip("pyspark")
+    from delta import configure_spark_with_delta_pip
+    from pyspark.sql import SparkSession
+
+    builder = (
+        SparkSession.builder.master("local[1]")
+        .appName("delta_export_oracle")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.sql.session.timeZone", "UTC")
+        .config("spark.sql.shuffle.partitions", "1")
+        .config("spark.ui.enabled", "false")
+    )
+    session = configure_spark_with_delta_pip(builder).getOrCreate()
+    yield session
+    session.stop()
+
+
 @pytest.fixture(scope="session")
 def extension_path():
     path = os.environ.get("DELTA_EXPORT_EXTENSION_PATH")

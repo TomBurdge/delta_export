@@ -3,6 +3,8 @@
 import json
 import os
 
+from delta_readers import delta_rs_count
+
 
 def _find_delta_log(data_path):
     """Walk data_path to find the _delta_log directory."""
@@ -113,6 +115,7 @@ def test_roundtrip_heavy_mutations(ducklake_env):
 
     ducklake_count = conn.execute("SELECT count(*) FROM events").fetchone()[0]
     delta_count = conn.execute(f"SELECT count(*) FROM delta_scan('{delta_table_root}')").fetchone()[0]
+    assert delta_rs_count(delta_table_root) == delta_count
     print(f"DuckLake count: {ducklake_count}, Delta count: {delta_count}")
     assert ducklake_count == delta_count, f"Row count mismatch: DuckLake={ducklake_count}, Delta={delta_count}"
 
@@ -183,6 +186,7 @@ def test_roundtrip_multiple_tables_with_mutations(ducklake_env):
         delta_table_root = os.path.dirname(delta_log)
         ducklake_count = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
         delta_count = conn.execute(f"SELECT count(*) FROM delta_scan('{delta_table_root}')").fetchone()[0]
+        assert delta_rs_count(delta_table_root) == delta_count
         print(f"{table}: DuckLake={ducklake_count}, Delta={delta_count}")
         assert ducklake_count == delta_count, f"{table} count mismatch: DuckLake={ducklake_count}, Delta={delta_count}"
 
@@ -218,6 +222,7 @@ def test_roundtrip_with_inline_threshold(ducklake_env):
 
     ducklake_count = conn.execute("SELECT count(*) FROM products").fetchone()[0]
     delta_count = conn.execute(f"SELECT count(*) FROM delta_scan('{delta_table_root}')").fetchone()[0]
+    assert delta_rs_count(delta_table_root) == delta_count
     print(f"DuckLake count: {ducklake_count}, Delta count: {delta_count}")
     assert ducklake_count == delta_count, f"Row count mismatch: DuckLake={ducklake_count}, Delta={delta_count}"
 
@@ -264,6 +269,7 @@ def test_sqlite_backend_export(ducklake_sqlite_env):
     delta_table_root = os.path.dirname(delta_log)
     ducklake_count = conn.execute("SELECT count(*) FROM orders").fetchone()[0]
     delta_count = conn.execute(f"SELECT count(*) FROM delta_scan('{delta_table_root}')").fetchone()[0]
+    assert delta_rs_count(delta_table_root) == delta_count
     print(f"SQLite backend: DuckLake={ducklake_count}, Delta={delta_count}")
     assert ducklake_count == delta_count, f"SQLite row count mismatch: DuckLake={ducklake_count}, Delta={delta_count}"
 
@@ -326,6 +332,7 @@ def test_dbt_duckdb_pattern(extension_path, tmp_path):
             table_name = meta[0] if meta else "unknown"
             ducklake_count = conn.execute(f"SELECT count(*) FROM ducklake.aemo.{table_name}").fetchone()[0]
             delta_count = conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0]
+            assert delta_rs_count(root) == delta_count
             print(f"dbt pattern - {table_name}: DuckLake={ducklake_count}, Delta={delta_count}")
             assert (
                 ducklake_count == delta_count
@@ -399,4 +406,5 @@ def test_data_type_mappings(ducklake_env):
     # Also verify delta_scan can read the data back
     delta_table_root = os.path.dirname(delta_log)
     delta_count = conn.execute(f"SELECT count(*) FROM delta_scan('{delta_table_root}')").fetchone()[0]
+    assert delta_rs_count(delta_table_root) == delta_count
     assert delta_count == 1, f"Expected 1 row from delta_scan, got {delta_count}"

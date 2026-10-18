@@ -8,6 +8,8 @@ import os
 
 import duckdb
 
+from delta_readers import delta_rs_count
+
 
 def _find_delta_log(data_path):
     for root, dirs, files in os.walk(data_path):
@@ -26,7 +28,9 @@ def _delta_count(conn, data_path):
     delta_log = _find_delta_log(data_path)
     assert delta_log is not None, f"_delta_log not found under {data_path}"
     root = os.path.dirname(delta_log)
-    return conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0]
+    count = conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0]
+    assert delta_rs_count(root) == count
+    return count
 
 
 def _run_hidden_default_attach(extension_path, tmp_path, attach_prefix, meta_file):

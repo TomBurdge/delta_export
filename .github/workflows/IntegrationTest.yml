@@ -43,8 +43,50 @@ jobs:
           path: ./artifact
           search_artifacts: true
 
-      - run: pip install duckdb==1.5.5 pytest
+      - run: pip install duckdb==1.5.5 deltalake pyarrow pytest
 
-      - run: pytest test/python/ -v -s --tb=long
+      # delta_scan (delta-kernel-rs) and delta-rs read every export; Spark runs in its own job
+      - run: pytest test/python/ -v -s --tb=long -m "not spark"
+        env:
+          DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
+
+  spark-tests:
+    name: Spark reader tests
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download extension artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: delta_export-linux_amd64
+          run_id: ${{ github.event.workflow_run.id }}
+          path: ./artifact
+          search_artifacts: true
+          if_no_artifact_found: warn
+
+      - name: Fallback - download latest artifact
+        if: ${{ hashFiles('artifact/delta_export.duckdb_extension') == '' }}
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: delta_export-linux_amd64
+          workflow: LinuxBuild.yml
+          path: ./artifact
+          search_artifacts: true
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - run: pip install duckdb==1.5.5 pyspark==3.5.3 delta-spark==3.2.1 pyarrow pytest
+
+      # Spark + Delta Lake is the reference reader
+      - run: pytest test/python/test_spark_oracle.py -v -s --tb=long -m spark
         env:
           DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
