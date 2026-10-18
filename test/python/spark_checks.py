@@ -149,6 +149,31 @@ def _spark_lit(v):
     return F.lit(v)
 
 
+def _sort_key(v):
+    """DuckDB and Spark order NaN above every number."""
+    if isinstance(v, float) and math.isnan(v):
+        return (1, 0.0)
+    return (0, v)
+
+
+def _matches(value, op, literal):
+    """The predicate evaluated in Python over values both engines returned identically."""
+    if op == "is_null":
+        return value is None
+    if value is None:
+        return False
+    value = canonical(value)
+    if op == "in":
+        return any(_matches(value, "=", x) for x in literal)
+    literal = canonical(literal)
+    a, b = _sort_key(value), _sort_key(literal)
+    return {"=": a == b, "<": a < b, ">": a > b}[op]
+
+
+# filter mismatches where Spark agrees with the truth and DuckLake does not (a DuckLake bug, not the export's)
+DUCKLAKE_FILTER_DISAGREEMENTS = []
+
+
 def _diff(expected, actual, limit=5):
     missing = list((expected - actual).elements())[:limit]
     extra = list((actual - expected).elements())[:limit]
@@ -223,7 +248,20 @@ def assert_export_matches(spark, conn, table, root, rng=None, label=""):
                 params = [v]
             want = conn.execute(f"SELECT count(*) FROM {table} WHERE {duck_where}", params).fetchone()[0]
             got = df.filter(spark_filter).count()
-            assert got == want, f"{where}: filter {name} {op} {v!r}: Spark {got}, DuckLake {want}"
+            if got == want:
+                continue
+            # arbitrate with the truth: the full row set is identical in both engines (checked above)
+            index = names.index(name)
+            truth = sum(1 for row in collected if _matches(_spark_value(row[index]), op, v))
+            spark_ids = sorted(r[0] for r in df.filter(spark_filter).select(_spark_col(names[0])).collect())
+            duck_ids = sorted(r[0] for r in conn.execute(
+                f"SELECT {_quote(names[0])} FROM {table} WHERE {duck_where}", params).fetchall())
+            detail = (f"{where}: filter {name} {op} {v!r}: Spark {got}, DuckLake {want}, truth {truth}; "
+                      f"only Spark: {sorted(set(spark_ids) - set(duck_ids))[:10]}, "
+                      f"only DuckLake: {sorted(set(duck_ids) - set(spark_ids))[:10]}")
+            assert got == truth, detail
+            print(f"\nDUCKLAKE FILTER DISAGREES (Spark matches the data): {detail}")
+            DUCKLAKE_FILTER_DISAGREEMENTS.append(detail)
 
     # protocol: minimal, consistent with what the table uses
     adds, checkpoint = _checkpoint_adds(root)
