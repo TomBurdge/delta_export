@@ -147,6 +147,47 @@ WHERE es.status = 'needs_export'
 ORDER BY es.table_id, del.data_file_id;
 )";
 
+// For every live column of an exported table, the column as it was when each active data file was written.
+// A different name (rename) or a different column under the same name (drop + re-add) means name-based readers
+// would read NULL or the wrong data; a different type needs Delta type widening.
+static constexpr const char *SQL_GET_COLUMN_HISTORY = R"(
+WITH live AS (
+    SELECT c.table_id, c.column_id, c.column_name, c.column_type, c.parent_column
+    FROM {META}ducklake_column c
+    JOIN export_summary es ON es.table_id = c.table_id
+    WHERE es.status = 'needs_export' AND c.end_snapshot IS NULL
+),
+files AS (
+    SELECT DISTINCT df.table_id, df.begin_snapshot
+    FROM {META}ducklake_data_file df
+    JOIN export_summary es ON es.table_id = df.table_id
+    WHERE es.status = 'needs_export' AND df.end_snapshot IS NULL
+),
+at_write AS (
+    SELECT l.table_id, l.column_id, l.column_name, l.column_type, h.column_name AS old_name, h.column_type AS old_type
+    FROM live l
+    JOIN files f ON f.table_id = l.table_id
+    JOIN {META}ducklake_column h ON h.table_id = l.table_id AND h.column_id = l.column_id
+        AND h.begin_snapshot <= f.begin_snapshot AND (h.end_snapshot IS NULL OR h.end_snapshot > f.begin_snapshot)
+),
+same_name AS (
+    SELECT DISTINCT l.table_id, l.column_id, l.column_name, l.column_type
+    FROM live l
+    JOIN files f ON f.table_id = l.table_id
+    JOIN {META}ducklake_column o ON o.table_id = l.table_id AND o.column_id <> l.column_id
+        AND o.column_name = l.column_name AND o.parent_column IS NOT DISTINCT FROM l.parent_column
+        AND o.begin_snapshot <= f.begin_snapshot AND (o.end_snapshot IS NULL OR o.end_snapshot > f.begin_snapshot)
+)
+SELECT DISTINCT table_id, column_id, 'rename' AS kind, old_name AS detail, column_name, column_type
+FROM at_write WHERE old_name <> column_name
+UNION ALL
+SELECT DISTINCT table_id, column_id, 'type', old_type, column_name, column_type
+FROM at_write WHERE old_type <> column_type
+UNION ALL
+SELECT table_id, column_id, 'same_name', column_name, column_name, column_type FROM same_name
+ORDER BY 1, 2, 3, 4;
+)";
+
 // Dropped tables whose storage root no live table uses any more.
 static constexpr const char *SQL_GET_DROPPED_TABLES = R"(
 SELECT
@@ -184,15 +225,11 @@ ORDER BY c.table_id, c.column_order, c.column_id;
 static constexpr const char *SQL_CREATE_CHECKPOINT_PARQUET = R"(
 CREATE OR REPLACE TEMP TABLE temp_checkpoint_parquet AS
 WITH
+-- includes emptied tables that were exported before: they get a version without files
 tables_to_export AS (
     SELECT es.*
     FROM export_summary es
     WHERE es.status = 'needs_export'
-      AND EXISTS (
-          SELECT 1 FROM {META}ducklake_data_file df
-          WHERE df.table_id = es.table_id
-            AND df.end_snapshot IS NULL
-      )
 ),
 table_schemas AS (
     SELECT
@@ -201,7 +238,8 @@ table_schemas AS (
         te.table_name,
         te.snapshot_id,
         te.table_root,
-        tsj.schema_string
+        tsj.schema_string,
+        tsj.type_widening
     FROM tables_to_export te
     JOIN table_schema_json tsj USING (table_id)
 ),
@@ -234,40 +272,50 @@ file_column_stats_transformed AS (
         fca.column_type,
         fca.value_count,
         fca.null_count,
+        -- Readers skip files on these bounds, so a bound that may be wrong is left out: a missing bound only
+        -- costs skipping, a wrong one drops rows.
         CASE
             WHEN fca.min_value IS NULL THEN NULL
             WHEN contains(lower(fca.column_type), 'timestamp') THEN
-                regexp_replace(
-                    regexp_replace(replace(fca.min_value, ' ', 'T'), '[+-]\d{2}(?::\d{2})?$', ''),
-                    '^([^.]+)$', '\1.000'
-                ) || 'Z'
+                CASE
+                    -- the text drops the offset below; only UTC bounds can lose it safely
+                    WHEN regexp_matches(fca.min_value, '[+-]\d{2}(:\d{2})?$')
+                         AND NOT regexp_matches(fca.min_value, '[+-]00(:00)?$') THEN NULL
+                    ELSE regexp_replace(
+                        regexp_replace(replace(fca.min_value, ' ', 'T'), '[+-]\d{2}(?::\d{2})?$', ''),
+                        '^([^.]+)$', '\1.000'
+                    ) || 'Z'
+                END
             WHEN contains(lower(fca.column_type), 'date') THEN fca.min_value
             -- min/max are emitted as JSON strings; delta-kernel rejects a string for a boolean, and Delta writers
             -- do not collect boolean bounds anyway
             WHEN contains(lower(fca.column_type), 'bool') THEN NULL
-            WHEN contains(lower(fca.column_type), 'int') OR contains(lower(fca.column_type), 'float')
-                 OR contains(lower(fca.column_type), 'double') OR contains(lower(fca.column_type), 'decimal') THEN
-                CASE WHEN contains(fca.min_value, '.') OR contains(lower(fca.min_value), 'e')
-                     THEN CAST(TRY_CAST(fca.min_value AS DOUBLE) AS VARCHAR)
-                     ELSE CAST(TRY_CAST(fca.min_value AS BIGINT) AS VARCHAR)
-                END
+            -- the exact decimal text: going through DOUBLE rounds past the true bound
+            WHEN contains(lower(fca.column_type), 'decimal') THEN fca.min_value
+            -- NaN and infinities have no JSON number; a finite lower bound is still valid with NaN rows
+            WHEN contains(lower(fca.column_type), 'float') OR contains(lower(fca.column_type), 'double') THEN
+                CASE WHEN isfinite(TRY_CAST(fca.min_value AS DOUBLE))
+                     THEN CAST(TRY_CAST(fca.min_value AS DOUBLE) AS VARCHAR) END
+            WHEN contains(lower(fca.column_type), 'int') THEN CAST(TRY_CAST(fca.min_value AS BIGINT) AS VARCHAR)
             ELSE fca.min_value
         END AS transformed_min,
         CASE
             WHEN fca.max_value IS NULL THEN NULL
             WHEN contains(lower(fca.column_type), 'timestamp') THEN
-                regexp_replace(
-                    regexp_replace(replace(fca.max_value, ' ', 'T'), '[+-]\d{2}(?::\d{2})?$', ''),
-                    '^([^.]+)$', '\1.000'
-                ) || 'Z'
+                CASE
+                    WHEN regexp_matches(fca.max_value, '[+-]\d{2}(:\d{2})?$')
+                         AND NOT regexp_matches(fca.max_value, '[+-]00(:00)?$') THEN NULL
+                    ELSE regexp_replace(
+                        regexp_replace(replace(fca.max_value, ' ', 'T'), '[+-]\d{2}(?::\d{2})?$', ''),
+                        '^([^.]+)$', '\1.000'
+                    ) || 'Z'
+                END
             WHEN contains(lower(fca.column_type), 'date') THEN fca.max_value
             WHEN contains(lower(fca.column_type), 'bool') THEN NULL
-            WHEN contains(lower(fca.column_type), 'int') OR contains(lower(fca.column_type), 'float')
-                 OR contains(lower(fca.column_type), 'double') OR contains(lower(fca.column_type), 'decimal') THEN
-                CASE WHEN contains(fca.max_value, '.') OR contains(lower(fca.max_value), 'e')
-                     THEN CAST(TRY_CAST(fca.max_value AS DOUBLE) AS VARCHAR)
-                     ELSE CAST(TRY_CAST(fca.max_value AS BIGINT) AS VARCHAR)
-                END
+            WHEN contains(lower(fca.column_type), 'decimal') THEN fca.max_value
+            -- NaN sorts above every number and may be missing from the stored bound: no float upper bound
+            WHEN contains(lower(fca.column_type), 'float') OR contains(lower(fca.column_type), 'double') THEN NULL
+            WHEN contains(lower(fca.column_type), 'int') THEN CAST(TRY_CAST(fca.max_value AS BIGINT) AS VARCHAR)
             ELSE fca.max_value
         END AS transformed_max
     FROM file_column_stats_agg fca
@@ -280,6 +328,7 @@ file_metadata AS (
         ts.snapshot_id,
         ts.table_root,
         ts.schema_string,
+        ts.type_widening,
         df.data_file_id,
         df.path AS file_path,
         df.path_is_relative,
@@ -303,12 +352,11 @@ file_metadata AS (
             'value': fct.null_count
         } ORDER BY fct.column_name) FILTER (WHERE fct.column_name IS NOT NULL AND fct.null_count IS NOT NULL)), MAP{}::MAP(VARCHAR, BIGINT)) AS null_count
     FROM table_schemas ts
-    JOIN {META}ducklake_data_file df ON ts.table_id = df.table_id
+    LEFT JOIN {META}ducklake_data_file df ON ts.table_id = df.table_id AND df.end_snapshot IS NULL
     LEFT JOIN table_deletion_vectors dv ON dv.data_file_id = df.data_file_id
     LEFT JOIN file_column_stats_transformed fct ON df.data_file_id = fct.data_file_id
-    WHERE df.end_snapshot IS NULL
     GROUP BY ts.table_id, ts.schema_name, ts.table_name, ts.snapshot_id,
-             ts.table_root, ts.schema_string, df.data_file_id, df.path, df.path_is_relative,
+             ts.table_root, ts.schema_string, ts.type_widening, df.data_file_id, df.path, df.path_is_relative,
              df.file_size_bytes, df.record_count, dv.storage_type, dv.path_or_inline_dv,
              dv.dv_offset, dv.size_in_bytes, dv.cardinality
 ),
@@ -320,10 +368,12 @@ table_aggregates AS (
         snapshot_id,
         table_root,
         schema_string,
-        COUNT(*) AS num_files,
-        SUM(num_records) - COALESCE(SUM(dv_cardinality), 0) AS total_rows,
-        SUM(file_size_bytes) AS total_bytes,
-        bool_or(dv_storage_type IS NOT NULL) AS has_dv,
+        type_widening,
+        COUNT(data_file_id) AS num_files,
+        COALESCE(SUM(num_records), 0) - COALESCE(SUM(dv_cardinality), 0) AS total_rows,
+        COALESCE(SUM(file_size_bytes), 0) AS total_bytes,
+        COALESCE(bool_or(dv_storage_type IS NOT NULL), false) AS has_dv,
+        -- an emptied table has one row without a file: its list is NULL and unnests to no add rows
         list({
             'path': CASE WHEN COALESCE(path_is_relative, true) THEN ltrim(file_path, '/') ELSE file_path END,
             'partitionValues': MAP{}::MAP(VARCHAR, VARCHAR),
@@ -367,13 +417,22 @@ table_aggregates AS (
             stats VARCHAR,
             tags MAP(VARCHAR, VARCHAR),
             deletionVector STRUCT(storageType VARCHAR, pathOrInlineDv VARCHAR, "offset" INTEGER, sizeInBytes INTEGER, cardinality BIGINT)
-        )) AS add_entries
+        )) FILTER (WHERE data_file_id IS NOT NULL) AS add_entries
     FROM file_metadata
-    GROUP BY table_id, schema_name, table_name, snapshot_id, table_root, schema_string
+    GROUP BY table_id, schema_name, table_name, snapshot_id, table_root, schema_string, type_widening
 ),
 checkpoint_data AS (
     SELECT
         ta.*,
+        -- table features in use; none keeps the widely readable protocol 1 / 2
+        list_concat(
+            CASE WHEN ta.has_dv THEN ['deletionVectors'] ELSE []::VARCHAR[] END,
+            CASE WHEN ta.type_widening THEN ['typeWidening'] ELSE []::VARCHAR[] END
+        ) AS features,
+        map_concat(
+            CASE WHEN ta.has_dv THEN MAP{'delta.enableDeletionVectors': 'true'} ELSE MAP{}::MAP(VARCHAR, VARCHAR) END,
+            CASE WHEN ta.type_widening THEN MAP{'delta.enableTypeWidening': 'true'} ELSE MAP{}::MAP(VARCHAR, VARCHAR) END
+        ) AS configuration,
         COALESCE(es.table_uuid, '') AS table_uuid,
         COALESCE(es.schema_uuid, '') AS schema_uuid,
         now() AS now_ts,
@@ -404,13 +463,15 @@ checkpoint_parquet_data AS (
         cd.total_rows,
         cd.total_bytes,
         cd.has_dv,
+        cd.features,
+        cd.configuration,
         cd.table_uuid,
         cd.schema_uuid,
-        -- deletion vectors need reader 3 / writer 7; other tables keep the widely readable 1 / 2
+        -- table features need reader 3 / writer 7; other tables keep the widely readable 1 / 2
         CASE
-            WHEN cd.has_dv THEN {
+            WHEN len(cd.features) > 0 THEN {
                 'minReaderVersion': 3, 'minWriterVersion': 7,
-                'readerFeatures': ['deletionVectors'], 'writerFeatures': ['deletionVectors']
+                'readerFeatures': cd.features, 'writerFeatures': cd.features
             }::STRUCT(minReaderVersion INTEGER, minWriterVersion INTEGER, readerFeatures VARCHAR[], writerFeatures VARCHAR[])
             ELSE {
                 'minReaderVersion': 1, 'minWriterVersion': 2, 'readerFeatures': NULL, 'writerFeatures': NULL
@@ -450,6 +511,8 @@ checkpoint_parquet_data AS (
         cd.total_rows,
         cd.total_bytes,
         cd.has_dv,
+        cd.features,
+        cd.configuration,
         cd.table_uuid,
         cd.schema_uuid,
         NULL AS protocol,
@@ -460,10 +523,7 @@ checkpoint_parquet_data AS (
             'schemaString': cd.schema_string,
             'partitionColumns': []::VARCHAR[],
             'createdTime': cd.now_ms,
-            'configuration': CASE
-                WHEN cd.has_dv THEN MAP{'delta.enableDeletionVectors': 'true'}
-                ELSE MAP{}::MAP(VARCHAR, VARCHAR)
-            END
+            'configuration': cd.configuration
         }::STRUCT(
             id VARCHAR,
             name VARCHAR,
@@ -506,6 +566,8 @@ checkpoint_parquet_data AS (
         cd.total_rows,
         cd.total_bytes,
         cd.has_dv,
+        cd.features,
+        cd.configuration,
         cd.table_uuid,
         cd.schema_uuid,
         NULL AS protocol,
@@ -570,17 +632,14 @@ SELECT DISTINCT
             'schemaString': p.schema_string::VARCHAR,
             'partitionColumns': [],
             'createdTime': p.now_ms,
-            'configuration': CASE
-                WHEN p.has_dv THEN MAP{'delta.enableDeletionVectors': 'true'}
-                ELSE MAP{}::MAP(VARCHAR, VARCHAR)
-            END
+            'configuration': p.configuration
         }
     }) || chr(10) ||
     CASE
-        WHEN p.has_dv THEN to_json({
+        WHEN len(p.features) > 0 THEN to_json({
             'protocol': {
                 'minReaderVersion': 3, 'minWriterVersion': 7,
-                'readerFeatures': ['deletionVectors'], 'writerFeatures': ['deletionVectors']
+                'readerFeatures': p.features, 'writerFeatures': p.features
             }
         })
         ELSE to_json({
@@ -646,15 +705,19 @@ SELECT
         WHEN status = 'needs_export' THEN 'Data snapshot ' || snapshot_id || ' exported to Delta'
         WHEN status = 'removed_dropped' THEN 'Table was dropped in DuckLake; its Delta log was removed'
         WHEN status = 'remove_failed' THEN 'Table was dropped in DuckLake; removing its Delta log failed'
+        WHEN status = 'needs_rewrite' THEN 'Not exported: older data files do not match the current schema'
+        WHEN status = 'unsupported_column_name' THEN 'Not exported: a column name Delta does not allow'
     END AS explanation,
     message
 FROM export_summary
 ORDER BY
     CASE status
         WHEN 'needs_export' THEN 1
-        WHEN 'no_data_files' THEN 2
-        WHEN 'removed_dropped' THEN 3
-        WHEN 'remove_failed' THEN 4
+        WHEN 'needs_rewrite' THEN 2
+        WHEN 'unsupported_column_name' THEN 3
+        WHEN 'no_data_files' THEN 4
+        WHEN 'removed_dropped' THEN 5
+        WHEN 'remove_failed' THEN 6
     END,
     schema_name, table_name;
 )";
@@ -749,6 +812,19 @@ static unique_ptr<MaterializedQueryResult> ExecuteSQL(Connection &conn, const st
 	return result;
 }
 
+// Keeps a table out of this export; the status and message in the result say why. The first reason wins.
+static void HoldBack(Connection &conn, int64_t table_id, const string &status, const string &message) {
+	auto update = conn.Prepare(
+	    "UPDATE export_summary SET status = $1, message = $2 WHERE table_id = $3 AND status = 'needs_export'");
+	if (update->HasError()) {
+		throw InvalidInputException("Delta export failed: %s", update->GetError());
+	}
+	auto result = update->Execute(Value(status), Value(message), Value::BIGINT(table_id));
+	if (result->HasError()) {
+		throw InvalidInputException("Delta export failed: %s", result->GetError());
+	}
+}
+
 //===--------------------------------------------------------------------===//
 // Helper: Build the Delta Lake schemaString of each exported table
 //===--------------------------------------------------------------------===//
@@ -761,6 +837,8 @@ struct DuckLakeColumn {
 	int64_t parent_id = 0;
 	//! Indexes (into the table's column vector) of the nested child columns, in column_order
 	vector<idx_t> children;
+	//! Narrower Delta types older data files still hold for this column (type widening)
+	vector<string> type_history;
 };
 
 // DuckLake stores types as internal names (int32, varchar, ...). Delta has no equivalent for uuid, time,
@@ -857,10 +935,84 @@ static string JsonEscape(const string &input) {
 
 static string BuildDeltaType(const vector<DuckLakeColumn> &columns, idx_t idx);
 
+static bool ParseDeltaDecimal(const string &type, int &precision, int &scale) {
+	if (!StringUtil::StartsWith(type, "decimal(") || type.back() != ')') {
+		return false;
+	}
+	auto parts = StringUtil::Split(type.substr(8, type.size() - 9), ",");
+	if (parts.size() != 2) {
+		return false;
+	}
+	precision = std::stoi(parts[0]);
+	scale = std::stoi(parts[1]);
+	return true;
+}
+
+// Order of Delta types along the widenings Delta allows (byte < short < integer < long, float < double, decimals)
+static int DeltaTypeRank(const string &type) {
+	static const vector<string> order = {"byte", "short", "integer", "long", "float", "double"};
+	for (idx_t i = 0; i < order.size(); i++) {
+		if (order[i] == type) {
+			return NumericCast<int>(i);
+		}
+	}
+	int precision, scale;
+	return ParseDeltaDecimal(type, precision, scale) ? 100 + precision * 100 + scale : 100000;
+}
+
+//! Whether Delta's typeWidening feature lets files of type `from` be read as `to`
+static bool IsDeltaWidening(const string &from, const string &to) {
+	static const vector<string> integral = {"byte", "short", "integer", "long"};
+	static const int integral_digits[] = {3, 5, 10, 20};
+	auto rank = [&](const string &t) {
+		auto it = std::find(integral.begin(), integral.end(), t);
+		return it == integral.end() ? -1 : NumericCast<int>(it - integral.begin());
+	};
+	int from_rank = rank(from), to_rank = rank(to);
+	if (from_rank >= 0 && to_rank >= 0) {
+		return from_rank < to_rank;
+	}
+	if (from == "float" && to == "double") {
+		return true;
+	}
+	if (from_rank >= 0 && from_rank <= 2 && to == "double") {
+		return true;
+	}
+	int p1, s1, p2, s2;
+	bool from_decimal = ParseDeltaDecimal(from, p1, s1);
+	bool to_decimal = ParseDeltaDecimal(to, p2, s2);
+	if (from_decimal && to_decimal) {
+		return s2 >= s1 && p2 - s2 >= p1 - s1;
+	}
+	if (from_rank >= 0 && to_decimal) {
+		return p2 - s2 >= integral_digits[from_rank];
+	}
+	return false;
+}
+
+// delta.typeChanges: the widening steps older data files went through, oldest first
+static string BuildFieldMetadata(const DuckLakeColumn &col) {
+	if (col.type_history.empty()) {
+		return "{}";
+	}
+	auto chain = col.type_history;
+	std::sort(chain.begin(), chain.end(),
+	          [](const string &a, const string &b) { return DeltaTypeRank(a) < DeltaTypeRank(b); });
+	chain.push_back(MapPrimitiveType(col.type));
+	string changes;
+	for (idx_t i = 0; i + 1 < chain.size(); i++) {
+		if (!changes.empty()) {
+			changes += ",";
+		}
+		changes += "{\"fromType\":\"" + chain[i] + "\",\"toType\":\"" + chain[i + 1] + "\"}";
+	}
+	return "{\"delta.typeChanges\":[" + changes + "]}";
+}
+
 static string BuildDeltaField(const vector<DuckLakeColumn> &columns, idx_t idx) {
 	auto &col = columns[idx];
 	return "{\"name\":\"" + JsonEscape(col.name) + "\",\"type\":" + BuildDeltaType(columns, idx) +
-	       ",\"nullable\":" + (col.nullable ? "true" : "false") + ",\"metadata\":{}}";
+	       ",\"nullable\":" + (col.nullable ? "true" : "false") + ",\"metadata\":" + BuildFieldMetadata(col) + "}";
 }
 
 static string BuildDeltaType(const vector<DuckLakeColumn> &columns, idx_t idx) {
@@ -942,8 +1094,16 @@ static string BuildDeltaSchema(vector<DuckLakeColumn> &columns) {
 
 // Fills TEMP table table_schema_json(table_id, schema_string). TEMP tables are per connection, so this must
 // run on the same Connection as the rest of the export.
-static void BuildTableSchemas(Connection &conn, const MetadataLocation &meta) {
-	ExecuteSQL(conn, "CREATE OR REPLACE TEMP TABLE table_schema_json (table_id BIGINT, schema_string VARCHAR);");
+//! (table_id, column_id) -> narrower Delta types older data files still hold
+using WidenedColumns = std::map<std::pair<int64_t, int64_t>, std::set<string>>;
+
+// Delta forbids these in column names unless column mapping is on, and the Fabric SQL analytics endpoint only
+// supports column mapping by name, which cannot describe DuckLake files anyway
+static constexpr const char *DELTA_INVALID_NAME_CHARS = " ,;{}()\n\t=";
+
+static void BuildTableSchemas(Connection &conn, const MetadataLocation &meta, const WidenedColumns &widened) {
+	ExecuteSQL(conn, "CREATE OR REPLACE TEMP TABLE table_schema_json (table_id BIGINT, schema_string VARCHAR, "
+	                 "type_widening BOOLEAN);");
 	auto columns_result = ExecuteSQL(conn, QualifyMetadataTables(SQL_GET_EXPORT_COLUMNS, meta));
 
 	std::map<int64_t, vector<DuckLakeColumn>> table_columns;
@@ -959,16 +1119,62 @@ static void BuildTableSchemas(Connection &conn, const MetadataLocation &meta) {
 			col.has_parent = true;
 			col.parent_id = parent.GetValue<int64_t>();
 		}
+		auto history = widened.find(std::make_pair(table_id, col.column_id));
+		if (history != widened.end()) {
+			col.type_history.assign(history->second.begin(), history->second.end());
+		}
 		table_columns[table_id].push_back(std::move(col));
 	}
 
-	auto insert = conn.Prepare("INSERT INTO table_schema_json VALUES ($1, $2)");
+	auto insert = conn.Prepare("INSERT INTO table_schema_json VALUES ($1, $2, $3)");
 	if (insert->HasError()) {
 		throw InvalidInputException("Delta export failed: %s", insert->GetError());
 	}
 	for (auto &entry : table_columns) {
-		auto schema_string = BuildDeltaSchema(entry.second);
-		auto result = insert->Execute(Value::BIGINT(entry.first), Value(schema_string));
+		auto &columns = entry.second;
+		string invalid_name;
+		for (auto &col : columns) {
+			if (col.name.find_first_of(DELTA_INVALID_NAME_CHARS) != string::npos) {
+				invalid_name = col.name;
+				break;
+			}
+		}
+		if (!invalid_name.empty()) {
+			HoldBack(conn, entry.first, "unsupported_column_name",
+			         StringUtil::Format("column \"%s\" contains a character Delta only allows with column mapping "
+			                            "(space , ; { } ( ) = tab or newline); rename the column",
+			                            invalid_name));
+			continue;
+		}
+		auto schema_string = BuildDeltaSchema(columns);
+
+		std::map<int64_t, idx_t> index_of;
+		for (idx_t i = 0; i < columns.size(); i++) {
+			index_of[columns[i].column_id] = i;
+		}
+		bool type_widening = false;
+		string widened_element;
+		for (auto &col : columns) {
+			if (col.type_history.empty()) {
+				continue;
+			}
+			type_widening = true;
+			if (col.has_parent) {
+				auto parent_type = StringUtil::Lower(columns[index_of[col.parent_id]].type);
+				if (parent_type == "list" || parent_type == "map") {
+					widened_element = columns[index_of[col.parent_id]].name;
+				}
+			}
+		}
+		if (!widened_element.empty()) {
+			HoldBack(conn, entry.first, "needs_rewrite",
+			         StringUtil::Format("the element type of column \"%s\" was widened; older data files hold the "
+			                            "narrower type. Rewrite the table, e.g. CREATE OR REPLACE TABLE t AS SELECT * "
+			                            "FROM t",
+			                            widened_element));
+			continue;
+		}
+		auto result = insert->Execute(Value::BIGINT(entry.first), Value(schema_string), Value::BOOLEAN(type_widening));
 		if (result->HasError()) {
 			throw InvalidInputException("Delta export failed: %s", result->GetError());
 		}
@@ -1457,6 +1663,74 @@ static void RemoveDroppedTableLogs(Connection &conn, FileSystem &fs) {
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Helper: schema evolution and emptied tables
+//===--------------------------------------------------------------------===//
+static const string REWRITE_HINT = "Rewrite the table so every file uses the current schema, e.g. CREATE OR REPLACE "
+                                   "TABLE t AS SELECT * FROM t";
+
+// Holds back tables whose files cannot be described to name-based readers (rename, drop + re-add, a type change
+// Delta cannot widen) and returns the widened columns that the typeWidening feature covers.
+static WidenedColumns AnalyzeColumnHistory(Connection &conn, const MetadataLocation &meta) {
+	WidenedColumns widened;
+	auto history = ExecuteSQL(conn, QualifyMetadataTables(SQL_GET_COLUMN_HISTORY, meta));
+	for (idx_t i = 0; i < history->RowCount(); i++) {
+		auto table_id = history->GetValue(0, i).GetValue<int64_t>();
+		auto column_id = history->GetValue(1, i).GetValue<int64_t>();
+		auto kind = history->GetValue(2, i).ToString();
+		auto detail = history->GetValue(3, i).ToString();
+		auto name = history->GetValue(4, i).ToString();
+		auto type = history->GetValue(5, i).ToString();
+		if (kind == "rename") {
+			HoldBack(conn, table_id, "needs_rewrite",
+			         StringUtil::Format("column \"%s\" was renamed from \"%s\"; data files written before the rename "
+			                            "still use the old name, which readers that match columns by name (such as "
+			                            "the Fabric SQL analytics endpoint) read as NULL. %s",
+			                            name, detail, REWRITE_HINT));
+		} else if (kind == "same_name") {
+			HoldBack(conn, table_id, "needs_rewrite",
+			         StringUtil::Format("column \"%s\" was dropped and added again; older data files still hold the "
+			                            "dropped column under that name. %s",
+			                            name, REWRITE_HINT));
+		} else {
+			auto from = MapPrimitiveType(detail);
+			auto to = MapPrimitiveType(type);
+			if (from == to) {
+				continue; // same Delta type, e.g. both exported as string
+			}
+			if (IsDeltaWidening(from, to)) {
+				widened[std::make_pair(table_id, column_id)].insert(from);
+			} else {
+				HoldBack(conn, table_id, "needs_rewrite",
+				         StringUtil::Format("column \"%s\" changed type from %s to %s, which Delta type widening "
+				                            "cannot express for the older data files. %s",
+				                            name, detail, type, REWRITE_HINT));
+			}
+		}
+	}
+	return widened;
+}
+
+// An emptied table keeps the log of its last export; export it again as a version without files so readers
+// stop showing the old rows. Empty tables that were never exported stay no_data_files.
+static void MarkEmptiedExportedTables(Connection &conn, FileSystem &fs, const MetadataLocation &meta) {
+	auto empty = ExecuteSQL(conn, "SELECT table_id, table_root FROM export_summary "
+	                              "WHERE status = 'no_data_files' AND table_root IS NOT NULL");
+	for (idx_t i = 0; i < empty->RowCount(); i++) {
+		auto table_root = empty->GetValue(1, i).ToString();
+		if (ExistingMaxDeltaVersion(fs, table_root + "/_delta_log") < 0) {
+			continue;
+		}
+		ExecuteSQL(conn, QualifyMetadataTables(
+		                     "UPDATE export_summary SET status = 'needs_export', "
+		                     "message = 'Table has no data files; exported as an empty Delta table', "
+		                     "snapshot_id = COALESCE(snapshot_id, (SELECT MAX(snapshot_id) FROM {META}ducklake_snapshot)) "
+		                     "WHERE table_id = " +
+		                         empty->GetValue(0, i).ToString(),
+		                     meta));
+	}
+}
+
 struct DeltaExportBindData : public TableFunctionData {};
 
 struct DeltaExportGlobalState : public GlobalTableFunctionState {
@@ -1536,12 +1810,16 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 	ExecuteSQL(conn, QualifyMetadataTables(SQL_CREATE_TABLE_ROOTS, meta));
 	ExecuteSQL(conn, QualifyMetadataTables(SQL_INSERT_EXPORT_SUMMARY, meta));
 
-	// Step 2: Build the Delta schema of every exported table (nested types, nulls_allowed)
-	BuildTableSchemas(conn, meta);
-
-	// Step 3: Turn DuckLake delete files and inlined deletes into Delta deletion vectors
 	// The client file system carries the secrets of the session (S3, Azure, ...)
 	auto &fs = FileSystem::GetFileSystem(context);
+	MarkEmptiedExportedTables(conn, fs, meta);
+
+	// Step 2: Hold back tables whose older files no longer match the schema, then build the Delta schema of
+	// every exported table (nested types, nulls_allowed, type widening)
+	auto widened = AnalyzeColumnHistory(conn, meta);
+	BuildTableSchemas(conn, meta, widened);
+
+	// Step 3: Turn DuckLake delete files and inlined deletes into Delta deletion vectors
 	std::map<int64_t, string> dv_files;
 	BuildDeletionVectors(conn, fs, meta, dv_files);
 
