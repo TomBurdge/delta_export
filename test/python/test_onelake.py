@@ -58,6 +58,9 @@ def onelake_env(extension_path, tmp_path):
         f"LOAD azure;"
         f"INSTALL delta;"
     )
+    # The default transport fails the OneLake TLS handshake on Linux ("Problem with the SSL CA cert");
+    # curl uses the system CA bundle
+    con.execute("SET azure_transport_option_type = 'curl'")
     con.execute(f"CREATE SECRET onelake (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{_storage_token()}')")
     con.execute(f"ATTACH 'ducklake:{tmp_path / 'meta.ducklake'}' AS test_lake (DATA_PATH '{data_path}')")
     con.execute("USE test_lake")
