@@ -1241,6 +1241,43 @@ static vector<OpenFileInfo> GlobOrEmpty(FileSystem &fs, const string &pattern) {
 	}
 }
 
+//! abfs[s]://<container>@<account>.dfs.<suffix>/<path> -> az://<account>.blob.<suffix>/<container>/<path>, or ""
+static string DfsToBlobUrl(const string &path) {
+	for (auto prefix : {"abfss://", "abfs://"}) {
+		if (!StringUtil::StartsWith(path, prefix)) {
+			continue;
+		}
+		auto rest = path.substr(strlen(prefix));
+		auto at = rest.find('@');
+		auto slash = rest.find('/', at == string::npos ? 0 : at);
+		if (at == string::npos || slash == string::npos) {
+			return string();
+		}
+		auto host = rest.substr(at + 1, slash - at - 1);
+		auto dfs = host.find(".dfs.");
+		if (dfs == string::npos) {
+			return string();
+		}
+		return "az://" + host.substr(0, dfs) + ".blob." + host.substr(dfs + 5) + "/" + rest.substr(0, at) +
+		       rest.substr(slash);
+	}
+	return string();
+}
+
+// OneLake answers DFS deletes with an error body the Azure SDK cannot parse ("type must be string, but is
+// object"); the blob endpoint, which delta-rs uses on OneLake, deletes the same file fine
+static void RemoveFileWithFallback(FileSystem &fs, const string &path) {
+	try {
+		fs.RemoveFile(path);
+	} catch (std::exception &) {
+		auto blob_url = DfsToBlobUrl(path);
+		if (blob_url.empty()) {
+			throw;
+		}
+		fs.RemoveFile(blob_url);
+	}
+}
+
 //! Delta version of a _delta_log file name (00000000000000000012.json, .checkpoint.parquet, ...), or -1
 static int64_t DeltaVersionOf(const string &file_name) {
 	if (file_name.size() < 21 || file_name[20] != '.') {
@@ -1535,7 +1572,7 @@ static void RemoveStaleDeletionVectors(FileSystem &fs, const string &table_root,
 	for (auto &file : GlobOrEmpty(fs, table_root + "/deletion_vector_*.bin")) {
 		if (BaseName(file.path) != keep_name) {
 			try {
-				fs.TryRemoveFile(file.path);
+				RemoveFileWithFallback(fs, file.path);
 			} catch (std::exception &) {
 				// best effort: a stale file only costs storage
 			}
@@ -1562,11 +1599,11 @@ static void RemoveDeltaLog(FileSystem &fs, const string &table_root) {
 	auto delta_log = table_root + "/_delta_log";
 	for (auto &file : fs.Glob(delta_log + "/*")) {
 		if (!FileSystem::IsDirectory(file)) {
-			fs.RemoveFile(file.path);
+			RemoveFileWithFallback(fs, file.path);
 		}
 	}
 	for (auto &file : fs.Glob(table_root + "/deletion_vector_*.bin")) {
-		fs.RemoveFile(file.path);
+		RemoveFileWithFallback(fs, file.path);
 	}
 	if (!IsRemotePath(table_root) && fs.DirectoryExists(delta_log)) {
 		fs.RemoveDirectory(delta_log);
