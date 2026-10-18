@@ -90,3 +90,48 @@ jobs:
       - run: pytest test/python/test_spark_oracle.py -v -s --tb=long -m spark
         env:
           DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
+
+  onelake-tests:
+    # Live OneLake round trip. Auth is GitHub OIDC only: the test exchanges the job's id-token for a
+    # storage token (workload-identity federation, no client secret, no az login).
+    name: OneLake tests
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      ONELAKE_WAREHOUSE: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download extension artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: delta_export-linux_amd64
+          run_id: ${{ github.event.workflow_run.id }}
+          path: ./artifact
+          search_artifacts: true
+          if_no_artifact_found: warn
+
+      - name: Fallback - download latest artifact
+        if: ${{ hashFiles('artifact/delta_export.duckdb_extension') == '' }}
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          name: delta_export-linux_amd64
+          workflow: LinuxBuild.yml
+          path: ./artifact
+          search_artifacts: true
+
+      - run: pip install duckdb==1.5.5 azure-identity pytest
+
+      - run: pytest test/python/test_onelake.py -v -s --tb=long
+        env:
+          DELTA_EXPORT_EXTENSION_PATH: ./artifact/delta_export.duckdb_extension
