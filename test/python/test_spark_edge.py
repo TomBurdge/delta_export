@@ -114,8 +114,15 @@ def test_type_widening_chain(spark, lake):
     """Each step leaves files of the narrower type; Spark reads them through the typeWidening feature."""
     conn, data_path = lake
     conn.execute("CREATE TABLE w (id BIGINT, n TINYINT, f FLOAT, u UTINYINT)")
-    steps = [None, ("n", "SMALLINT"), ("n", "INTEGER"), ("n", "BIGINT"), ("f", "DOUBLE"), ("u", "USMALLINT"),
-             ("u", "UINTEGER")]
+    steps = [
+        None,
+        ("n", "SMALLINT"),
+        ("n", "INTEGER"),
+        ("n", "BIGINT"),
+        ("f", "DOUBLE"),
+        ("u", "USMALLINT"),
+        ("u", "UINTEGER"),
+    ]
     for step, change in enumerate(steps):
         if change:
             conn.execute(f"ALTER TABLE w ALTER COLUMN {change[0]} TYPE {change[1]}")

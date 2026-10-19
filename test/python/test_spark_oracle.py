@@ -56,9 +56,7 @@ def test_spark_primitive_types_multi_table(spark, ducklake_env):
     assert [tuple(bytes(v) if isinstance(v, (bytearray, memoryview)) else v for v in r) for r in actual] == expected
 
     # timestamps: compare as UTC instants
-    ts = conn.execute(
-        "SELECT ts, timezone('UTC', tstz) FROM typed ORDER BY i64"
-    ).fetchall()
+    ts = conn.execute("SELECT ts, timezone('UTC', tstz) FROM typed ORDER BY i64").fetchall()
     spark_ts = _spark_rows(spark, roots["typed"], ["ts", "tstz"], "i64")
     assert spark_ts == ts
 
@@ -154,9 +152,7 @@ def test_spark_type_widening(spark, ducklake_env):
 def test_spark_nested_types(spark, ducklake_env):
     conn, data_path = ducklake_env
     conn.execute("CREATE TABLE nested (id INTEGER, tags VARCHAR[], info STRUCT(a INTEGER, b VARCHAR))")
-    conn.execute(
-        "INSERT INTO nested VALUES (1, ['x', 'y'], {'a': 10, 'b': 'ten'}), (2, [], {'a': 20, 'b': NULL})"
-    )
+    conn.execute("INSERT INTO nested VALUES (1, ['x', 'y'], {'a': 10, 'b': 'ten'}), (2, [], {'a': 20, 'b': NULL})")
     _export(conn)
     root = find_delta_roots(data_path)["nested"]
     spark._jvm.org.apache.spark.sql.delta.DeltaLog.clearCache()

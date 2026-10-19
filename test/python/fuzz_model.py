@@ -13,9 +13,24 @@ import duckdb
 # DuckDB types the fuzzer puts in tables. Types delta_export maps to a lossy 'string' (uint64, hugeint,
 # uuid, time, interval) are left out on purpose: Delta has no type for them.
 PRIMITIVE_TYPES = [
-    "TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER",
-    "FLOAT", "DOUBLE", "DECIMAL(9,2)", "DECIMAL(18,6)", "DECIMAL(38,10)",
-    "BOOLEAN", "VARCHAR", "BLOB", "DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE",
+    "TINYINT",
+    "SMALLINT",
+    "INTEGER",
+    "BIGINT",
+    "UTINYINT",
+    "USMALLINT",
+    "UINTEGER",
+    "FLOAT",
+    "DOUBLE",
+    "DECIMAL(9,2)",
+    "DECIMAL(18,6)",
+    "DECIMAL(38,10)",
+    "BOOLEAN",
+    "VARCHAR",
+    "BLOB",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMP WITH TIME ZONE",
 ]
 NESTED_TYPES = ["INTEGER[]", "STRUCT(a INTEGER, b VARCHAR)", "MAP(VARCHAR, INTEGER)"]
 
@@ -50,36 +65,47 @@ def value_expr(duck_type, row, salt, seed):
     if t in ints:
         lo, hi, span = ints[t]
         offset = 0 if t.startswith("U") else (span // 2)
-        inner = (f"CASE {v} % 20 WHEN 0 THEN ({lo})::{t} WHEN 1 THEN ({hi})::{t} "
-                 f"ELSE (({v} % {span})::HUGEINT - {offset})::{t} END")
+        inner = (
+            f"CASE {v} % 20 WHEN 0 THEN ({lo})::{t} WHEN 1 THEN ({hi})::{t} "
+            f"ELSE (({v} % {span})::HUGEINT - {offset})::{t} END"
+        )
     elif t in ("FLOAT", "DOUBLE"):
-        inner = (f"CASE {v} % 25 WHEN 0 THEN 'nan'::{t} WHEN 1 THEN 'inf'::{t} WHEN 2 THEN '-inf'::{t} "
-                 f"WHEN 3 THEN '-0.0'::{t} ELSE ((({v} % 2000000)::DOUBLE - 1000000) / 7)::{t} END")
+        inner = (
+            f"CASE {v} % 25 WHEN 0 THEN 'nan'::{t} WHEN 1 THEN 'inf'::{t} WHEN 2 THEN '-inf'::{t} "
+            f"WHEN 3 THEN '-0.0'::{t} ELSE ((({v} % 2000000)::DOUBLE - 1000000) / 7)::{t} END"
+        )
     elif t.startswith("DECIMAL"):
-        precision, scale = (int(x) for x in t[t.index("(") + 1:-1].split(","))
+        precision, scale = (int(x) for x in t[t.index("(") + 1 : -1].split(","))
         modulus = 10 ** min(precision, 18)
-        inner = (f"((({v} % {modulus})::HUGEINT - {modulus // 2})::DECIMAL(38,0) / {10 ** scale})"
-                 f"::DECIMAL({precision},{scale})")
+        inner = (
+            f"((({v} % {modulus})::HUGEINT - {modulus // 2})::DECIMAL(38,0) / {10 ** scale})"
+            f"::DECIMAL({precision},{scale})"
+        )
     elif t == "BOOLEAN":
         inner = f"{v} % 2 = 0"
     elif t == "VARCHAR":
-        inner = (f"CASE {v} % 7 WHEN 0 THEN '' WHEN 1 THEN 'é漢字🙂' || ({v} % 100) "
-                 f"WHEN 2 THEN 'it''s \"q\" ' || ({v} % 100) WHEN 3 THEN repeat('x', 1000) || ({v} % 100) "
-                 f"WHEN 4 THEN repeat('p', 40) || ({v} % 1000) ELSE 'v' || ({v} % 5000) END")
+        inner = (
+            f"CASE {v} % 7 WHEN 0 THEN '' WHEN 1 THEN 'é漢字🙂' || ({v} % 100) "
+            f"WHEN 2 THEN 'it''s \"q\" ' || ({v} % 100) WHEN 3 THEN repeat('x', 1000) || ({v} % 100) "
+            f"WHEN 4 THEN repeat('p', 40) || ({v} % 1000) ELSE 'v' || ({v} % 5000) END"
+        )
     elif t == "BLOB":
         inner = f"('b' || ({v} % 1000))::BLOB"
     elif t == "DATE":
-        inner = (f"CASE {v} % 20 WHEN 0 THEN DATE '0001-01-01' WHEN 1 THEN DATE '9999-12-31' "
-                 f"WHEN 2 THEN DATE '1900-01-01' "
-                 f"ELSE DATE '1970-01-01' + (({v} % 40000)::BIGINT - 20000)::INTEGER END")
+        inner = (
+            f"CASE {v} % 20 WHEN 0 THEN DATE '0001-01-01' WHEN 1 THEN DATE '9999-12-31' "
+            f"WHEN 2 THEN DATE '1900-01-01' "
+            f"ELSE DATE '1970-01-01' + (({v} % 40000)::BIGINT - 20000)::INTEGER END"
+        )
     elif t in ("TIMESTAMP", "TIMESTAMP WITH TIME ZONE"):
-        ts = (f"CASE {v} % 20 WHEN 0 THEN TIMESTAMP '1900-01-01 00:00:00.000001' "
-              f"WHEN 1 THEN TIMESTAMP '9999-12-31 23:59:59.999999' "
-              f"ELSE TIMESTAMP '1950-01-01' + to_microseconds(({v} % 3000000000000000)::BIGINT) END")
+        ts = (
+            f"CASE {v} % 20 WHEN 0 THEN TIMESTAMP '1900-01-01 00:00:00.000001' "
+            f"WHEN 1 THEN TIMESTAMP '9999-12-31 23:59:59.999999' "
+            f"ELSE TIMESTAMP '1950-01-01' + to_microseconds(({v} % 3000000000000000)::BIGINT) END"
+        )
         inner = ts if t == "TIMESTAMP" else f"({ts})::TIMESTAMPTZ"
     elif t == "INTEGER[]":
-        inner = (f"CASE WHEN {v} % 5 = 0 THEN []::INTEGER[] "
-                 f"ELSE [({v} % 100)::INTEGER, ({v} % 7)::INTEGER] END")
+        inner = f"CASE WHEN {v} % 5 = 0 THEN []::INTEGER[] " f"ELSE [({v} % 100)::INTEGER, ({v} % 7)::INTEGER] END"
     elif t.startswith("STRUCT"):
         inner = f"{{'a': ({v} % 100)::INTEGER, 'b': 'v' || ({v} % 5)}}::{duck_type}"
     elif t.startswith("MAP"):
@@ -335,10 +361,24 @@ class Fuzzer:
         self.on_export(self, rows)
 
     OPS = [
-        ("op_insert", 14), ("op_delete", 10), ("op_update", 8), ("op_merge", 6), ("op_delete_all", 1),
-        ("op_add_column", 4), ("op_drop_column", 3), ("op_rename_column", 2), ("op_widen", 4),
-        ("op_partition", 3), ("op_flush", 6), ("op_rewrite", 3), ("op_merge_files", 2), ("op_expire", 2),
-        ("op_replace", 2), ("op_drop_table", 1), ("op_recreate_table", 1), ("op_create_table", 2),
+        ("op_insert", 14),
+        ("op_delete", 10),
+        ("op_update", 8),
+        ("op_merge", 6),
+        ("op_delete_all", 1),
+        ("op_add_column", 4),
+        ("op_drop_column", 3),
+        ("op_rename_column", 2),
+        ("op_widen", 4),
+        ("op_partition", 3),
+        ("op_flush", 6),
+        ("op_rewrite", 3),
+        ("op_merge_files", 2),
+        ("op_expire", 2),
+        ("op_replace", 2),
+        ("op_drop_table", 1),
+        ("op_recreate_table", 1),
+        ("op_create_table", 2),
         ("op_export", 6),
     ]
 

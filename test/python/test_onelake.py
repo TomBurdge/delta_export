@@ -102,9 +102,13 @@ class SqlEndpoint:
         POST .../refreshMetadata answers 200 with the per-table statuses, or 202 with a long running operation
         whose result (GET <Location>/result) holds them.
         """
-        body = {"tables": [{"schema": schema, "tableNames": list(tables)}],
-                "timeout": {"timeUnit": "Minutes", "value": 10}}
-        status, headers, result = _fabric("POST", f"/workspaces/{self.workspace}/sqlEndpoints/{self.id}/refreshMetadata", body)
+        body = {
+            "tables": [{"schema": schema, "tableNames": list(tables)}],
+            "timeout": {"timeUnit": "Minutes", "value": 10},
+        }
+        status, headers, result = _fabric(
+            "POST", f"/workspaces/{self.workspace}/sqlEndpoints/{self.id}/refreshMetadata", body
+        )
         if status == 202:
             location = headers.get("Location") or headers.get("location")
             deadline = time.time() + 900
@@ -138,8 +142,13 @@ class SqlEndpoint:
         return [tuple(r) for r in cursor.fetchall()]
 
     def tables(self, prefix):
-        return {r[1]: r[0] for r in self.query(
-            "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE ?", (prefix + "%",))}
+        return {
+            r[1]: r[0]
+            for r in self.query(
+                "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE ?",
+                (prefix + "%",),
+            )
+        }
 
 
 @pytest.fixture
@@ -183,15 +192,19 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
     cleaned = False
     try:
         # deletion vectors: deletes, update and merge without any rewrite
-        conn.execute(f"CREATE TABLE {q(dv)} AS SELECT i AS id, (i % 7)::INTEGER AS grp, 'n' || (i % 500) AS name "
-                     f"FROM range(20000) t(i)")
+        conn.execute(
+            f"CREATE TABLE {q(dv)} AS SELECT i AS id, (i % 7)::INTEGER AS grp, 'n' || (i % 500) AS name "
+            f"FROM range(20000) t(i)"
+        )
         conn.execute("CALL ducklake_flush_inlined_data('test_lake')")
         conn.execute(f"DELETE FROM {q(dv)} WHERE id % 7 = 0")
         conn.execute(f"UPDATE {q(dv)} SET name = 'updated' WHERE id % 11 = 0")
         # partitioned, with deletes
         conn.execute(f"CREATE TABLE {q(part)} (id BIGINT, region VARCHAR, amount INTEGER)")
         conn.execute(f"ALTER TABLE {q(part)} SET PARTITIONED BY (region)")
-        conn.execute(f"INSERT INTO {q(part)} SELECT i, ['east', 'west', 'north'][i % 3 + 1], i % 1000 FROM range(9000) t(i)")
+        conn.execute(
+            f"INSERT INTO {q(part)} SELECT i, ['east', 'west', 'north'][i % 3 + 1], i % 1000 FROM range(9000) t(i)"
+        )
         conn.execute("CALL ducklake_flush_inlined_data('test_lake')")
         conn.execute(f"DELETE FROM {q(part)} WHERE id % 4 = 0")
         # widened column: old files hold INT32
@@ -214,9 +227,11 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
         assert {dv, part, widen, renamed, dropped} <= set(seen), seen
 
         # second round: more deletes, a rename (held back) and a drop (log removed)
-        conn.execute(f"MERGE INTO {q(dv)} AS tgt USING (SELECT i AS id FROM range(19900, 20100) t(i)) AS src "
-                     f"ON tgt.id = src.id WHEN MATCHED THEN DELETE "
-                     f"WHEN NOT MATCHED THEN INSERT VALUES (src.id, (src.id % 7)::INTEGER, 'merged')")
+        conn.execute(
+            f"MERGE INTO {q(dv)} AS tgt USING (SELECT i AS id FROM range(19900, 20100) t(i)) AS src "
+            f"ON tgt.id = src.id WHEN MATCHED THEN DELETE "
+            f"WHEN NOT MATCHED THEN INSERT VALUES (src.id, (src.id % 7)::INTEGER, 'merged')"
+        )
         conn.execute(f"ALTER TABLE {q(renamed)} RENAME COLUMN name TO full_name")
         conn.execute(f"INSERT INTO {q(renamed)} VALUES (1000, 'new')")
         conn.execute(f"DROP TABLE {q(dropped)}")
@@ -228,8 +243,10 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
         # delta_scan over abfss:// agrees before asking Fabric
         for t in (dv, part, widen):
             root = posixpath.join(data_path, SCHEMA, t)
-            assert conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0] == \
-                conn.execute(f"SELECT count(*) FROM {q(t)}").fetchone()[0], t
+            assert (
+                conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0]
+                == conn.execute(f"SELECT count(*) FROM {q(t)}").fetchone()[0]
+            ), t
 
         # sync the endpoint to the new versions; the dropped table has no log any more
         synced = endpoint.sync(SCHEMA, [dv, part, widen, renamed, dropped])
@@ -244,16 +261,26 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
             assert got == want, f"SQL endpoint {got} != DuckLake {want}\n  {sql_endpoint_sql}"
 
         fq = lambda t: f"[{seen[t]}].[{t}]"  # noqa: E731
-        both(f"SELECT count(*), sum(id), count(DISTINCT name), count(*) FILTER (name = 'updated') FROM {q(dv)}",
-             f"SELECT COUNT_BIG(*), SUM(id), COUNT(DISTINCT name), SUM(CASE WHEN name = 'updated' THEN 1 ELSE 0 END) FROM {fq(dv)}")
-        both(f"SELECT count(*) FROM {q(dv)} WHERE id % 7 = 0 AND id < 19900",
-             f"SELECT COUNT_BIG(*) FROM {fq(dv)} WHERE id % 7 = 0 AND id < 19900")
-        both(f"SELECT count(*), sum(amount), count(DISTINCT region) FROM {q(part)}",
-             f"SELECT COUNT_BIG(*), SUM(CAST(amount AS BIGINT)), COUNT(DISTINCT region) FROM {fq(part)}")
-        both(f"SELECT count(*), min(score), max(score), sum(id) FROM {q(widen)}",
-             f"SELECT COUNT_BIG(*), MIN(score), MAX(score), SUM(id) FROM {fq(widen)}")
+        both(
+            f"SELECT count(*), sum(id), count(DISTINCT name), count(*) FILTER (name = 'updated') FROM {q(dv)}",
+            f"SELECT COUNT_BIG(*), SUM(id), COUNT(DISTINCT name), SUM(CASE WHEN name = 'updated' THEN 1 ELSE 0 END) FROM {fq(dv)}",
+        )
+        both(
+            f"SELECT count(*) FROM {q(dv)} WHERE id % 7 = 0 AND id < 19900",
+            f"SELECT COUNT_BIG(*) FROM {fq(dv)} WHERE id % 7 = 0 AND id < 19900",
+        )
+        both(
+            f"SELECT count(*), sum(amount), count(DISTINCT region) FROM {q(part)}",
+            f"SELECT COUNT_BIG(*), SUM(CAST(amount AS BIGINT)), COUNT(DISTINCT region) FROM {fq(part)}",
+        )
+        both(
+            f"SELECT count(*), min(score), max(score), sum(id) FROM {q(widen)}",
+            f"SELECT COUNT_BIG(*), MIN(score), MAX(score), SUM(id) FROM {fq(widen)}",
+        )
         # the held-back table still shows its last good export: old name, no NULLs
-        assert endpoint.query(f"SELECT COUNT_BIG(*), SUM(CASE WHEN name IS NULL THEN 1 ELSE 0 END) FROM {fq(renamed)}")[0] == (100, 0)
+        assert endpoint.query(f"SELECT COUNT_BIG(*), SUM(CASE WHEN name IS NULL THEN 1 ELSE 0 END) FROM {fq(renamed)}")[
+            0
+        ] == (100, 0)
 
         # leave nothing behind, and prove it: every remaining run table's log is removed
         removed = {r[0]: r[1] for r in _cleanup(conn, (dv, part, widen, renamed, dropped))}

@@ -30,8 +30,21 @@ SIMPLE_TYPES = {
     "TIMESTAMP": "timestamp",
     "TIMESTAMP WITH TIME ZONE": "timestamp",
 }
-FILTERABLE = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER", "DOUBLE",
-              "BOOLEAN", "VARCHAR", "DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"}
+FILTERABLE = {
+    "TINYINT",
+    "SMALLINT",
+    "INTEGER",
+    "BIGINT",
+    "UTINYINT",
+    "USMALLINT",
+    "UINTEGER",
+    "DOUBLE",
+    "BOOLEAN",
+    "VARCHAR",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMP WITH TIME ZONE",
+}
 
 
 def _split_top(s):
@@ -62,7 +75,7 @@ def spark_type(duck_type):
         for field in _split_top(t[7:-1]):
             if field.startswith('"'):
                 end = field.index('"', 1)
-                name, rest = field[1:end], field[end + 1:]
+                name, rest = field[1:end], field[end + 1 :]
             else:
                 name, rest = field.split(" ", 1)
             fields.append(f"{name}:{spark_type(rest)}")
@@ -71,7 +84,7 @@ def spark_type(duck_type):
         key, value = _split_top(t[4:-1])
         return f"map<{spark_type(key)},{spark_type(value)}>"
     if up.startswith("DECIMAL"):
-        p, s = (int(x) for x in up[up.index("(") + 1:-1].split(","))
+        p, s = (int(x) for x in up[up.index("(") + 1 : -1].split(","))
         return f"decimal({p},{s})"
     return SIMPLE_TYPES[up]
 
@@ -204,13 +217,16 @@ def assert_export_matches(spark, conn, table, root, rng=None, label=""):
     assert list(spark_fields) == names, f"{where}: columns {list(spark_fields)} != {names}"
     for name, duck_type, nullable in columns:
         field = spark_fields[name]
-        assert field.dataType.simpleString() == spark_type(duck_type), (
-            f"{where}: {name} is {field.dataType.simpleString()}, expected {spark_type(duck_type)} for {duck_type}")
+        assert field.dataType.simpleString() == spark_type(
+            duck_type
+        ), f"{where}: {name} is {field.dataType.simpleString()}, expected {spark_type(duck_type)} for {duck_type}"
         assert field.nullable == nullable, f"{where}: {name} nullable {field.nullable} != {nullable}"
 
     # every row, as a multiset
     quoted = ", ".join(_quote(n) for n in names)
-    expected = Counter(tuple(canonical(v) for v in row) for row in conn.execute(f"SELECT {quoted} FROM {table}").fetchall())
+    expected = Counter(
+        tuple(canonical(v) for v in row) for row in conn.execute(f"SELECT {quoted} FROM {table}").fetchall()
+    )
     collected = df.collect()
     actual = Counter(tuple(canonical(_spark_value(v)) for v in row) for row in collected)
     assert actual == expected, f"{where}: rows differ\n{_diff(expected, actual)}"
@@ -224,11 +240,16 @@ def assert_export_matches(spark, conn, table, root, rng=None, label=""):
         q = _quote(name)
         stats = conn.execute(
             f"SELECT min({q}), max({q}) FROM {table} WHERE {q} IS NOT NULL"
-            + (f" AND isfinite({q})" if duck_type.upper() == "DOUBLE" else "")).fetchone()
-        sample = [r[0] for r in conn.execute(
-            f"SELECT {q} FROM {table} WHERE {q} IS NOT NULL"
             + (f" AND isfinite({q})" if duck_type.upper() == "DOUBLE" else "")
-            + " USING SAMPLE 3 ROWS").fetchall()]
+        ).fetchone()
+        sample = [
+            r[0]
+            for r in conn.execute(
+                f"SELECT {q} FROM {table} WHERE {q} IS NOT NULL"
+                + (f" AND isfinite({q})" if duck_type.upper() == "DOUBLE" else "")
+                + " USING SAMPLE 3 ROWS"
+            ).fetchall()
+        ]
         literals = [v for v in [stats[0], stats[1], *sample] if v is not None]
         predicates = [("is_null", None)]
         for v in literals[:3]:
@@ -254,11 +275,15 @@ def assert_export_matches(spark, conn, table, root, rng=None, label=""):
             index = names.index(name)
             truth = sum(1 for row in collected if _matches(_spark_value(row[index]), op, v))
             spark_ids = sorted(r[0] for r in df.filter(spark_filter).select(_spark_col(names[0])).collect())
-            duck_ids = sorted(r[0] for r in conn.execute(
-                f"SELECT {_quote(names[0])} FROM {table} WHERE {duck_where}", params).fetchall())
-            detail = (f"{where}: filter {name} {op} {v!r}: Spark {got}, DuckLake {want}, truth {truth}; "
-                      f"only Spark: {sorted(set(spark_ids) - set(duck_ids))[:10]}, "
-                      f"only DuckLake: {sorted(set(duck_ids) - set(spark_ids))[:10]}")
+            duck_ids = sorted(
+                r[0]
+                for r in conn.execute(f"SELECT {_quote(names[0])} FROM {table} WHERE {duck_where}", params).fetchall()
+            )
+            detail = (
+                f"{where}: filter {name} {op} {v!r}: Spark {got}, DuckLake {want}, truth {truth}; "
+                f"only Spark: {sorted(set(spark_ids) - set(duck_ids))[:10]}, "
+                f"only DuckLake: {sorted(set(duck_ids) - set(spark_ids))[:10]}"
+            )
             assert got == truth, detail
             print(f"\nDUCKLAKE FILTER DISAGREES (Spark matches the data): {detail}")
             DUCKLAKE_FILTER_DISAGREEMENTS.append(detail)

@@ -1304,9 +1304,11 @@ static string BlobToDfsUrl(const string &path) {
 		return string();
 	}
 	auto container_end = rest.find('/', host_end + 1);
-	auto container = rest.substr(host_end + 1, container_end == string::npos ? string::npos : container_end - host_end - 1);
+	auto container =
+	    rest.substr(host_end + 1, container_end == string::npos ? string::npos : container_end - host_end - 1);
 	auto host = rest.substr(0, blob) + ".dfs." + rest.substr(blob + 6, host_end - blob - 6);
-	return "abfss://" + container + "@" + host + (container_end == string::npos ? string() : rest.substr(container_end));
+	return "abfss://" + container + "@" + host +
+	       (container_end == string::npos ? string() : rest.substr(container_end));
 }
 
 // Some OneLake DFS listings come back in a shape the Azure SDK cannot parse ("type must be string, but is
@@ -1689,9 +1691,8 @@ static void RemoveDroppedTableLogs(Connection &conn, FileSystem &fs) {
 		                                schema_uuid.IsNull() ? string() : schema_uuid.ToString(),
 		                                true};
 	}
-	auto schemas =
-	    ExecuteSQL(conn, "SELECT DISTINCT schema_name, schema_uuid, schema_root FROM schema_roots "
-	                     "WHERE schema_root IS NOT NULL AND schema_uuid IS NOT NULL");
+	auto schemas = ExecuteSQL(conn, "SELECT DISTINCT schema_name, schema_uuid, schema_root FROM schema_roots "
+	                                "WHERE schema_root IS NOT NULL AND schema_uuid IS NOT NULL");
 	const string checkpoint_suffix = "/_delta_log/_last_checkpoint";
 	for (idx_t i = 0; i < schemas->RowCount(); i++) {
 		auto schema_root = schemas->GetValue(2, i).ToString();
@@ -1707,12 +1708,9 @@ static void RemoveDroppedTableLogs(Connection &conn, FileSystem &fs) {
 			if (live_roots.count(root) || candidates.count(root)) {
 				continue;
 			}
-			candidates[root] = DroppedTable {root,
-			                                 Value(LogicalType::BIGINT),
-			                                 schemas->GetValue(0, i).ToString(),
-			                                 BaseName(root),
-			                                 schemas->GetValue(1, i).ToString(),
-			                                 false};
+			candidates[root] =
+			    DroppedTable {root,           Value(LogicalType::BIGINT),         schemas->GetValue(0, i).ToString(),
+			                  BaseName(root), schemas->GetValue(1, i).ToString(), false};
 		}
 	}
 	if (candidates.empty()) {
@@ -1820,13 +1818,14 @@ static void MarkEmptiedExportedTables(Connection &conn, FileSystem &fs, const Me
 		if (ExistingMaxDeltaVersion(fs, table_root + "/_delta_log") < 0) {
 			continue;
 		}
-		ExecuteSQL(conn, QualifyMetadataTables(
-		                     "UPDATE export_summary SET status = 'needs_export', "
-		                     "message = 'Table has no data files; exported as an empty Delta table', "
-		                     "snapshot_id = COALESCE(snapshot_id, (SELECT MAX(snapshot_id) FROM {META}ducklake_snapshot)) "
-		                     "WHERE table_id = " +
-		                         empty->GetValue(0, i).ToString(),
-		                     meta));
+		ExecuteSQL(conn,
+		           QualifyMetadataTables(
+		               "UPDATE export_summary SET status = 'needs_export', "
+		               "message = 'Table has no data files; exported as an empty Delta table', "
+		               "snapshot_id = COALESCE(snapshot_id, (SELECT MAX(snapshot_id) FROM {META}ducklake_snapshot)) "
+		               "WHERE table_id = " +
+		                   empty->GetValue(0, i).ToString(),
+		               meta));
 	}
 }
 
@@ -1836,9 +1835,8 @@ static void MarkEmptiedExportedTables(Connection &conn, FileSystem &fs, const Me
 static constexpr const char *DV_STRUCT_NULL = "NULL::STRUCT(storageType VARCHAR, pathOrInlineDv VARCHAR, \"offset\" "
                                               "INTEGER, sizeInBytes INTEGER, cardinality BIGINT)";
 // A logical file: its path plus the deletion vector applied to it
-static constexpr const char *ADD_KEY_SQL =
-    "add.path || '|' || COALESCE(add.deletionVector.pathOrInlineDv || ':' || "
-    "CAST(add.deletionVector.\"offset\" AS VARCHAR), '')";
+static constexpr const char *ADD_KEY_SQL = "add.path || '|' || COALESCE(add.deletionVector.pathOrInlineDv || ':' || "
+                                           "CAST(add.deletionVector.\"offset\" AS VARCHAR), '')";
 
 // Fills TEMP tables prev_adds(k, path, size, dv) and prev_meta(id, schema_string, configuration,
 // protocol_versions) from the checkpoint of the previous version. False when it cannot be read.
@@ -1861,8 +1859,9 @@ static bool LoadPreviousState(Connection &conn, const string &checkpoint) {
 	    "(SELECT metaData.id FROM " +
 	    source + " WHERE metaData IS NOT NULL) AS id, (SELECT metaData.schemaString FROM " + source +
 	    " WHERE metaData IS NOT NULL) AS schema_string, (SELECT to_json(metaData.configuration)::VARCHAR FROM " +
-	    source + " WHERE metaData IS NOT NULL) AS configuration, (SELECT CAST(protocol.minReaderVersion AS VARCHAR) || ',' || "
-	             "CAST(protocol.minWriterVersion AS VARCHAR) FROM " +
+	    source +
+	    " WHERE metaData IS NOT NULL) AS configuration, (SELECT CAST(protocol.minReaderVersion AS VARCHAR) || ',' || "
+	    "CAST(protocol.minWriterVersion AS VARCHAR) FROM " +
 	    source + " WHERE protocol IS NOT NULL) AS protocol_versions");
 	return !meta->HasError();
 }
@@ -2011,16 +2010,17 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 		                     " AND snapshot_id = " + sid + ";");
 		if (has_previous) {
 			auto changes = ExecuteSQL(
-			    conn, "SELECT (SELECT count(*) FROM new_adds WHERE k NOT IN (SELECT k FROM prev_adds)) + "
-			          "(SELECT count(*) FROM prev_adds WHERE k NOT IN (SELECT k FROM new_adds)) + "
-			          "(SELECT count(*) FROM prev_meta pm, temp_checkpoint_parquet m, temp_checkpoint_parquet p "
-			          " WHERE m.table_id = " +
-			              tid + " AND m.row_order = 2 AND p.table_id = " + tid +
-			              " AND p.row_order = 1 AND (pm.id IS DISTINCT FROM m.metaData.id"
-			              " OR pm.schema_string IS DISTINCT FROM m.metaData.schemaString"
-			              " OR pm.configuration IS DISTINCT FROM to_json(m.metaData.configuration)::VARCHAR"
-			              " OR pm.protocol_versions IS DISTINCT FROM CAST(p.protocol.minReaderVersion AS VARCHAR) || ',' || "
-			              "CAST(p.protocol.minWriterVersion AS VARCHAR)))");
+			    conn,
+			    "SELECT (SELECT count(*) FROM new_adds WHERE k NOT IN (SELECT k FROM prev_adds)) + "
+			    "(SELECT count(*) FROM prev_adds WHERE k NOT IN (SELECT k FROM new_adds)) + "
+			    "(SELECT count(*) FROM prev_meta pm, temp_checkpoint_parquet m, temp_checkpoint_parquet p "
+			    " WHERE m.table_id = " +
+			        tid + " AND m.row_order = 2 AND p.table_id = " + tid +
+			        " AND p.row_order = 1 AND (pm.id IS DISTINCT FROM m.metaData.id"
+			        " OR pm.schema_string IS DISTINCT FROM m.metaData.schemaString"
+			        " OR pm.configuration IS DISTINCT FROM to_json(m.metaData.configuration)::VARCHAR"
+			        " OR pm.protocol_versions IS DISTINCT FROM CAST(p.protocol.minReaderVersion AS VARCHAR) || ',' || "
+			        "CAST(p.protocol.minWriterVersion AS VARCHAR)))");
 			if (changes->GetValue(0, 0).GetValue<int64_t>() == 0) {
 				continue; // nothing changed since the last export: no new version
 			}

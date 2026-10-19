@@ -20,8 +20,20 @@ import duckdb
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
 from fuzz_model import Fuzzer, quote  # noqa: E402
 
-FILTERABLE = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER", "DOUBLE",
-              "VARCHAR", "DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"}
+FILTERABLE = {
+    "TINYINT",
+    "SMALLINT",
+    "INTEGER",
+    "BIGINT",
+    "UTINYINT",
+    "USMALLINT",
+    "UINTEGER",
+    "DOUBLE",
+    "VARCHAR",
+    "DATE",
+    "TIMESTAMP",
+    "TIMESTAMP WITH TIME ZONE",
+}
 FLUSH = "CALL ducklake_flush_inlined_data('test_lake')"
 FLUSH_OTHER = FLUSH + "  -- on a second connection to the same database"
 
@@ -38,8 +50,10 @@ def attach(work, inline):
     conn = duckdb.connect()
     conn.execute("SET TimeZone = 'UTC'")
     limit = "" if inline else ", DATA_INLINING_ROW_LIMIT 0"
-    conn.execute(f"INSTALL ducklake; ATTACH 'ducklake:{work}/meta.ducklake' AS test_lake "
-                 f"(DATA_PATH '{work}/data'{limit}); USE test_lake;")
+    conn.execute(
+        f"INSTALL ducklake; ATTACH 'ducklake:{work}/meta.ducklake' AS test_lake "
+        f"(DATA_PATH '{work}/data'{limit}); USE test_lake;"
+    )
     return conn
 
 
@@ -58,10 +72,18 @@ def checks_for(conn, tables):
             if duck_type.upper() not in FILTERABLE and not duck_type.upper().startswith("DECIMAL"):
                 continue
             q = quote(name)
-            values = [r[0] for r in conn.execute(
-                f"SELECT DISTINCT {q} FROM {table} WHERE {q} IS NOT NULL ORDER BY 1 LIMIT 40").fetchall()]
-            values += [r[0] for r in conn.execute(
-                f"SELECT {q} FROM {table} WHERE {q} IS NOT NULL ORDER BY {q} DESC LIMIT 5").fetchall()]
+            values = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT DISTINCT {q} FROM {table} WHERE {q} IS NOT NULL ORDER BY 1 LIMIT 40"
+                ).fetchall()
+            ]
+            values += [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT {q} FROM {table} WHERE {q} IS NOT NULL ORDER BY {q} DESC LIMIT 5"
+                ).fetchall()
+            ]
             for v in values:
                 if isinstance(v, float) and v != v:
                     continue
@@ -129,7 +151,7 @@ def ddmin(statements, test):
     n = 2
     while len(statements) >= 2:
         chunk = max(1, len(statements) // n)
-        subsets = [statements[i:i + chunk] for i in range(0, len(statements), chunk)]
+        subsets = [statements[i : i + chunk] for i in range(0, len(statements), chunk)]
         reduced = False
         for i in range(len(subsets)):
             complement = [s for j, sub in enumerate(subsets) if j != i for s in sub]
@@ -148,7 +170,8 @@ def main():
     probe = duckdb.connect()
     probe.execute("INSTALL ducklake; LOAD ducklake")
     version = probe.execute(
-        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'").fetchone()[0]
+        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'"
+    ).fetchone()[0]
     print(f"duckdb {duckdb.__version__}, ducklake {version}")
     for seed in (int(s) for s in sys.argv[1:]):
         work = os.path.join(work_root, f"seed{seed}")
