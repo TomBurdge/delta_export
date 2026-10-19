@@ -6,7 +6,7 @@ on:
     inputs:
       seeds:
         description: 'Fuzz seeds to replay'
-        default: '21 29'
+        default: ''
 
 permissions:
   contents: read
@@ -23,4 +23,9 @@ jobs:
 
       - run: pip install duckdb==1.5.5 pytz
 
-      - run: python test/repro/ducklake_filter_repro.py ${{ inputs.seeds }}
+      - name: Minimal script (test/repro/ducklake_filter_bug.sql)
+        run: python test/repro/run_filter_bug.py
+
+      - name: Search and minimise from fuzz seeds
+        if: ${{ inputs.seeds != '' }}
+        run: python test/repro/ducklake_filter_repro.py ${{ inputs.seeds }}

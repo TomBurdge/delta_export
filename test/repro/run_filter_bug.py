@@ -1,0 +1,39 @@
+"""Runs ducklake_filter_bug.sql and shows the filtered queries that miss rows, with literals and parameters."""
+
+import os
+import shutil
+from decimal import Decimal
+
+import duckdb
+
+shutil.rmtree("/tmp/ducklake_filter_bug", ignore_errors=True)
+os.makedirs("/tmp/ducklake_filter_bug")
+conn = duckdb.connect()
+script = open(os.path.join(os.path.dirname(__file__), "ducklake_filter_bug.sql")).read()
+for statement in [s.strip() for s in script.split(";\n") if s.strip() and not s.strip().startswith("--")]:
+    conn.execute(statement)
+
+print("duckdb", duckdb.__version__, "ducklake", conn.execute(
+    "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'").fetchone()[0])
+value = Decimal("-49791089.6266012800")
+for label, sql, params in [
+    ("full scan, count_if", "SELECT count_if(c7 > -49791089.6266012800::DECIMAL(38,10)) FROM t2", []),
+    ("filter, DECIMAL(38,10) literal", "SELECT count(*) FROM t2 WHERE c7 > -49791089.6266012800::DECIMAL(38,10)", []),
+    ("filter, untyped literal", "SELECT count(*) FROM t2 WHERE c7 > -49791089.6266012800", []),
+    ("filter, bound parameter", "SELECT count(*) FROM t2 WHERE c7 > ?", [value]),
+    ("filter, c7 IS NOT NULL", "SELECT count(*) FROM t2 WHERE c7 IS NOT NULL", []),
+    ("full scan, count(c7)", "SELECT count(c7) FROM t2", []),
+    ("filter, id >= 0", "SELECT count(*) FROM t2 WHERE id >= 0", []),
+    ("full scan, count(*)", "SELECT count(*) FROM t2", []),
+]:
+    print(f"{label:34} {conn.execute(sql, params).fetchone()[0]}")
+
+rows_filtered = {r[0] for r in conn.execute(
+    "SELECT id FROM t2 WHERE c7 > -49791089.6266012800::DECIMAL(38,10)").fetchall()}
+all_rows = {r[0]: r for r in conn.execute("SELECT id, grp, c7, c3, c2 FROM t2").fetchall()}
+truth = {i for i, r in all_rows.items() if r[2] is not None and r[2] > value}
+print("ids the filtered query misses:", sorted(truth - rows_filtered)[:20])
+for i in sorted(truth - rows_filtered)[:5]:
+    print("  ", all_rows[i])
+print("files:", conn.execute("SELECT data_file, data_file_size_bytes, delete_file FROM ducklake_list_files('lake', 't2')").fetchall())
+print(conn.execute("EXPLAIN SELECT count(*) FROM t2 WHERE c7 > -49791089.6266012800::DECIMAL(38,10)").fetchall()[0][1])
