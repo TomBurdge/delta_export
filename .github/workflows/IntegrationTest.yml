@@ -76,7 +76,7 @@ jobs:
           key: pytest-python-${{ github.run_id }}
           restore-keys: pytest-python-
 
-      - run: pip install duckdb==1.5.5 deltalake pyarrow pytest
+      - run: pip install duckdb==1.5.6 deltalake pyarrow pytest
 
       # delta_scan (delta-kernel-rs) and delta-rs read every export; Spark runs in its own job
       - name: pytest
@@ -135,7 +135,7 @@ jobs:
 
       # delta-spark 4.2.0 pins pyspark <= 4.1.1
       # pytz: DuckDB needs it to return TIMESTAMPTZ values to Python
-      - run: pip install duckdb==1.5.5 pyspark==4.1.1 delta-spark==4.2.0 pyarrow pytz pytest
+      - run: pip install duckdb==1.5.6 pyspark==4.1.1 delta-spark==4.2.0 pyarrow pytz pytest
 
       # Spark + Delta Lake is the reference reader: smoke suite, edge cases, randomized workloads
       - name: pytest
@@ -192,6 +192,6 @@ jobs:
           path: ./artifact
           search_artifacts: true
 
-      - run: pip install duckdb==1.5.5 azure-identity mssql-python pytest
+      - run: pip install duckdb==1.5.6 azure-identity mssql-python pytest
 
       - run: pytest test/python/test_onelake.py -v -s --tb=long

@@ -39,7 +39,7 @@ Three workflows:
 
 ## DuckDB v1.5.x API
 
-- Pinned to v1.5.5 (submodules `duckdb` and `extension-ci-tools`, workflow versions, pip pin in IntegrationTest.yml) — keep all four in sync.
+- Pinned to v1.5.6 (submodules `duckdb` and `extension-ci-tools`, workflow versions, pip pin in IntegrationTest.yml) — keep all four in sync.
 - DuckLake on DuckDB >= 1.5.3 attaches its metadata catalog `HIDDEN`, so it is absent from `duckdb_databases()`. Never discover it through SQL; `ResolveMetadataLocation` enumerates `DatabaseManager::GetDatabases` (includes hidden entries) from the main context. Hidden catalogs still resolve by name in queries.
 - Use `ExtensionLoader`, not `ExtensionUtil` (removed). No `#define DUCKDB_EXTENSION_MAIN`.
 - `Connection::Query()` returns `unique_ptr<MaterializedQueryResult>` directly.
