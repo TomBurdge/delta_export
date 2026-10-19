@@ -1806,6 +1806,43 @@ static void MarkEmptiedExportedTables(Connection &conn, FileSystem &fs, const Me
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// Helper: the previous version, to write incremental commits
+//===--------------------------------------------------------------------===//
+static constexpr const char *DV_STRUCT_NULL = "NULL::STRUCT(storageType VARCHAR, pathOrInlineDv VARCHAR, \"offset\" "
+                                              "INTEGER, sizeInBytes INTEGER, cardinality BIGINT)";
+// A logical file: its path plus the deletion vector applied to it
+static constexpr const char *ADD_KEY_SQL =
+    "add.path || '|' || COALESCE(add.deletionVector.pathOrInlineDv || ':' || "
+    "CAST(add.deletionVector.\"offset\" AS VARCHAR), '')";
+
+// Fills TEMP tables prev_adds(k, path, size, dv) and prev_meta(id, schema_string, configuration,
+// protocol_versions) from the checkpoint of the previous version. False when it cannot be read.
+static bool LoadPreviousState(Connection &conn, const string &checkpoint) {
+	auto source = "read_parquet('" + EscapeSqlString(checkpoint) + "')";
+	auto adds = conn.Query("CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT " + string(ADD_KEY_SQL) +
+	                       " AS k, add.path AS path, add.size AS size, add.deletionVector AS dv FROM " + source +
+	                       " WHERE add IS NOT NULL");
+	if (adds->HasError()) {
+		// checkpoints written before deletion vectors have no add.deletionVector
+		adds = conn.Query("CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT add.path || '|' AS k, add.path AS path, "
+		                  "add.size AS size, " +
+		                  string(DV_STRUCT_NULL) + " AS dv FROM " + source + " WHERE add IS NOT NULL");
+		if (adds->HasError()) {
+			return false;
+		}
+	}
+	auto meta = conn.Query(
+	    "CREATE OR REPLACE TEMP TABLE prev_meta AS SELECT "
+	    "(SELECT metaData.id FROM " +
+	    source + " WHERE metaData IS NOT NULL) AS id, (SELECT metaData.schemaString FROM " + source +
+	    " WHERE metaData IS NOT NULL) AS schema_string, (SELECT to_json(metaData.configuration)::VARCHAR FROM " +
+	    source + " WHERE metaData IS NOT NULL) AS configuration, (SELECT CAST(protocol.minReaderVersion AS VARCHAR) || ',' || "
+	             "CAST(protocol.minWriterVersion AS VARCHAR) FROM " +
+	    source + " WHERE protocol IS NOT NULL) AS protocol_versions");
+	return !meta->HasError();
+}
+
 struct DeltaExportBindData : public TableFunctionData {};
 
 struct DeltaExportGlobalState : public GlobalTableFunctionState {
@@ -1931,16 +1968,43 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 		int64_t snapshot_id = ResultValue<int64_t>(*exports_result, 3, i, "exports_result");
 		string delta_log = exports_result->GetValue(4, i).ToString();
 
-		// The Delta version follows the DuckLake snapshot, but must stay above anything already in the folder: a
-		// replaced table or a recreated catalog can restart below an older log, and readers would keep using it.
+		string tid = std::to_string(table_id);
+		string sid = std::to_string(snapshot_id);
+
+		// Versions count up by one from the last one in the folder, and each commit carries the add and remove
+		// actions against the previous version: readers that apply commits incrementally (the Fabric SQL
+		// endpoint) see the change, readers that load the checkpoint written at every version see the same state.
 		auto existing_version = ExistingMaxDeltaVersion(fs, delta_log);
-		int64_t version = existing_version > snapshot_id ? existing_version + 1 : snapshot_id;
+		bool has_previous = existing_version >= 0 &&
+		                    LoadPreviousState(conn, DeltaLogFile(delta_log, existing_version, ".checkpoint.parquet"));
+		if (!has_previous) {
+			ExecuteSQL(conn, "CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT * FROM (SELECT NULL::VARCHAR AS k, "
+			                 "NULL::VARCHAR AS path, NULL::BIGINT AS size, " +
+			                     string(DV_STRUCT_NULL) + " AS dv) WHERE false;");
+		}
+		ExecuteSQL(conn, "CREATE OR REPLACE TEMP TABLE new_adds AS SELECT " + string(ADD_KEY_SQL) +
+		                     " AS k, add FROM temp_checkpoint_parquet WHERE row_order = 3 AND table_id = " + tid +
+		                     " AND snapshot_id = " + sid + ";");
+		if (has_previous) {
+			auto changes = ExecuteSQL(
+			    conn, "SELECT (SELECT count(*) FROM new_adds WHERE k NOT IN (SELECT k FROM prev_adds)) + "
+			          "(SELECT count(*) FROM prev_adds WHERE k NOT IN (SELECT k FROM new_adds)) + "
+			          "(SELECT count(*) FROM prev_meta pm, temp_checkpoint_parquet m, temp_checkpoint_parquet p "
+			          " WHERE m.table_id = " +
+			              tid + " AND m.row_order = 2 AND p.table_id = " + tid +
+			              " AND p.row_order = 1 AND (pm.id IS DISTINCT FROM m.metaData.id"
+			              " OR pm.schema_string IS DISTINCT FROM m.metaData.schemaString"
+			              " OR pm.configuration IS DISTINCT FROM to_json(m.metaData.configuration)::VARCHAR"
+			              " OR pm.protocol_versions IS DISTINCT FROM CAST(p.protocol.minReaderVersion AS VARCHAR) || ',' || "
+			              "CAST(p.protocol.minWriterVersion AS VARCHAR)))");
+			if (changes->GetValue(0, 0).GetValue<int64_t>() == 0) {
+				continue; // nothing changed since the last export: no new version
+			}
+		}
+		int64_t version = existing_version + 1;
 		string checkpoint_file = DeltaLogFile(delta_log, version, ".checkpoint.parquet");
 		string json_file = DeltaLogFile(delta_log, version, ".json");
 		string last_checkpoint_file = delta_log + "/_last_checkpoint";
-
-		string tid = std::to_string(table_id);
-		string sid = std::to_string(snapshot_id);
 		string ver = std::to_string(version);
 
 		string copy_parquet = "COPY (SELECT protocol, metaData, add, remove, commitInfo "
@@ -1952,12 +2016,23 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 		                      checkpoint_file + "' (FORMAT PARQUET);";
 		ExecuteSQL(conn, copy_parquet);
 
-		string copy_json = "COPY (SELECT content FROM temp_checkpoint_json "
-		                   "WHERE table_id = " +
-		                   tid + " AND snapshot_id = " + sid +
-		                   ") "
-		                   "TO '" +
-		                   json_file + "' (FORMAT CSV, HEADER false, QUOTE '');";
+		// commitInfo, metaData, protocol, then the files that left (with the deletion vector they had) and the
+		// files that arrived; a file whose deletion vector changed is removed and added again
+		string copy_json =
+		    "COPY (SELECT content FROM ("
+		    "SELECT 0 AS part, 0 AS n, content FROM temp_checkpoint_json WHERE table_id = " +
+		    tid + " AND snapshot_id = " + sid +
+		    " UNION ALL "
+		    "SELECT 1, row_number() OVER (ORDER BY path), to_json({'remove': {'path': path, "
+		    "'deletionTimestamp': epoch_ms(now()), 'dataChange': true, 'extendedFileMetadata': true, "
+		    "'partitionValues': MAP{}::MAP(VARCHAR, VARCHAR), 'size': size, 'deletionVector': dv}})::VARCHAR "
+		    "FROM prev_adds WHERE k NOT IN (SELECT k FROM new_adds)"
+		    " UNION ALL "
+		    "SELECT 2, row_number() OVER (ORDER BY k), to_json({'add': add})::VARCHAR "
+		    "FROM new_adds WHERE k NOT IN (SELECT k FROM prev_adds)"
+		    ") ORDER BY part, n) "
+		    "TO '" +
+		    json_file + "' (FORMAT CSV, HEADER false, QUOTE '');";
 		ExecuteSQL(conn, copy_json);
 
 		string copy_last = "COPY (SELECT '{\"version\":" + ver +
