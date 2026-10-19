@@ -180,6 +180,7 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
     dv, part, widen, renamed, dropped = (prefix + n for n in ("dv", "part", "widen", "renamed", "dropped"))
     q = lambda t: f"{SCHEMA}.{t}"  # noqa: E731
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+    cleaned = False
     try:
         # deletion vectors: deletes, update and merge without any rewrite
         conn.execute(f"CREATE TABLE {q(dv)} AS SELECT i AS id, (i % 7)::INTEGER AS grp, 'n' || (i % 500) AS name "
@@ -253,10 +254,22 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
              f"SELECT COUNT_BIG(*), MIN(score), MAX(score), SUM(id) FROM {fq(widen)}")
         # the held-back table still shows its last good export: old name, no NULLs
         assert endpoint.query(f"SELECT COUNT_BIG(*), SUM(CASE WHEN name IS NULL THEN 1 ELSE 0 END) FROM {fq(renamed)}")[0] == (100, 0)
+
+        # leave nothing behind, and prove it: every remaining run table's log is removed
+        removed = {r[0]: r[1] for r in _cleanup(conn, (dv, part, widen, renamed, dropped))}
+        assert all(removed.get(q(t)) == "removed_dropped" for t in (dv, part, widen, renamed)), removed
+        cleaned = True
     finally:
-        # leave nothing behind in the lakehouse: drop, expire, clean the files, remove the logs
-        for t in (dv, part, widen, renamed, dropped):
-            conn.execute(f"DROP TABLE IF EXISTS {q(t)}")
-        conn.execute("CALL ducklake_expire_snapshots('test_lake', older_than => now())")
-        conn.execute("CALL ducklake_cleanup_old_files('test_lake', cleanup_all => true)")
-        print(f"cleanup: {conn.execute('SELECT * FROM delta_export()').fetchall()}")
+        if not cleaned:
+            _cleanup(conn, (dv, part, widen, renamed, dropped))
+
+
+def _cleanup(conn, tables):
+    """Drop, expire, clean the files and remove the logs so the lakehouse does not fill with run tables."""
+    for t in tables:
+        conn.execute(f"DROP TABLE IF EXISTS {SCHEMA}.{t}")
+    conn.execute("CALL ducklake_expire_snapshots('test_lake', older_than => now())")
+    conn.execute("CALL ducklake_cleanup_old_files('test_lake', cleanup_all => true)")
+    rows = conn.execute("SELECT * FROM delta_export()").fetchall()
+    print(f"cleanup: {rows}")
+    return rows

@@ -1292,8 +1292,25 @@ static void RemoveFileWithFallback(FileSystem &fs, const string &path) {
 	}
 }
 
+//! az://<account>.blob.<suffix>/<container>/<path> -> abfss://<container>@<account>.dfs.<suffix>/<path>, or ""
+static string BlobToDfsUrl(const string &path) {
+	if (!StringUtil::StartsWith(path, "az://")) {
+		return string();
+	}
+	auto rest = path.substr(5);
+	auto host_end = rest.find('/');
+	auto blob = rest.find(".blob.");
+	if (host_end == string::npos || blob == string::npos || blob > host_end) {
+		return string();
+	}
+	auto container_end = rest.find('/', host_end + 1);
+	auto container = rest.substr(host_end + 1, container_end == string::npos ? string::npos : container_end - host_end - 1);
+	auto host = rest.substr(0, blob) + ".dfs." + rest.substr(blob + 6, host_end - blob - 6);
+	return "abfss://" + container + "@" + host + (container_end == string::npos ? string() : rest.substr(container_end));
+}
+
 // Some OneLake DFS listings come back in a shape the Azure SDK cannot parse ("type must be string, but is
-// number"); list the same folder through the blob endpoint then
+// number"); list the same folder through the blob endpoint then, and name the hits as the DFS paths callers use
 static vector<OpenFileInfo> GlobWithFallback(FileSystem &fs, const string &pattern) {
 	try {
 		return fs.Glob(pattern);
@@ -1302,7 +1319,14 @@ static vector<OpenFileInfo> GlobWithFallback(FileSystem &fs, const string &patte
 		if (blob_pattern.empty()) {
 			throw;
 		}
-		return fs.Glob(blob_pattern);
+		auto hits = fs.Glob(blob_pattern);
+		for (auto &hit : hits) {
+			auto dfs = BlobToDfsUrl(hit.path);
+			if (!dfs.empty()) {
+				hit.path = dfs;
+			}
+		}
+		return hits;
 	}
 }
 
