@@ -35,6 +35,18 @@ rows_filtered = {r[0] for r in conn.execute(
     "SELECT id FROM t2 WHERE c7 > -49791089.6266012800::DECIMAL(38,10)").fetchall()}
 all_rows = {r[0]: r for r in conn.execute("SELECT id, grp, c7, c3, c2 FROM t2").fetchall()}
 truth = {i for i, r in all_rows.items() if r[2] is not None and r[2] > value}
+print("python exact count (c7 > value):", len(truth), " filtered ids:", len(rows_filtered))
+print("only filtered:", sorted(rows_filtered - truth)[:10], " only python:", sorted(truth - rows_filtered)[:10])
+print("min(c7), max(c7):", conn.execute("SELECT min(c7), max(c7) FROM t2").fetchone())
+print("rows with c7 = value (full scan count_if):", conn.execute(
+    "SELECT count_if(c7 = -49791089.6266012800::DECIMAL(38,10)) FROM t2").fetchone()[0])
+print("rows with c7 = value (filtered):", conn.execute(
+    "SELECT count(*) FROM t2 WHERE c7 = -49791089.6266012800::DECIMAL(38,10)").fetchone()[0])
+print("count_if over a materialised copy:", conn.execute(
+    "CREATE TEMP TABLE copy AS SELECT * FROM t2; SELECT count_if(c7 > -49791089.6266012800::DECIMAL(38,10)), "
+    "count(*) FILTER (c7 > -49791089.6266012800::DECIMAL(38,10)) FROM copy").fetchone())
+print("filtered over the copy:", conn.execute(
+    "SELECT count(*) FROM copy WHERE c7 > -49791089.6266012800::DECIMAL(38,10)").fetchone()[0])
 print("ids the filtered query misses:", sorted(truth - rows_filtered)[:20])
 for i in sorted(truth - rows_filtered)[:5]:
     print("  ", all_rows[i])
