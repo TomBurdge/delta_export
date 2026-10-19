@@ -9,7 +9,8 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
-#include "duckdb/main/materialized_query_result.hpp"
+#include "duckdb/main/query_result.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -809,8 +810,43 @@ static string QualifyMetadataTables(const string &sql, const MetadataLocation &m
 //===--------------------------------------------------------------------===//
 // Helper: Execute SQL and throw on error
 //===--------------------------------------------------------------------===//
-static unique_ptr<MaterializedQueryResult> ExecuteSQL(Connection &conn, const string &sql) {
-	auto result = conn.Query(sql);
+// A completed query's rows, read by column and row. DuckDB 2.0 has no MaterializedQueryResult, and
+// ColumnDataCollection::GetValue materializes every row on each call, so the rows are materialized once here.
+class QueryRows {
+public:
+	explicit QueryRows(unique_ptr<QueryResult> result_p) : result(std::move(result_p)) {
+	}
+	bool HasError() const {
+		return result->HasError();
+	}
+	const string &GetError() const {
+		return result->GetError();
+	}
+	ExceptionType GetErrorType() const {
+		return result->GetErrorType();
+	}
+	idx_t RowCount() {
+		return result->RowCount();
+	}
+	Value GetValue(idx_t col, idx_t row) {
+		if (!rows) {
+			rows = make_uniq<ColumnDataRowCollection>(result->Collection().GetRows());
+		}
+		return rows->GetValue(col, row);
+	}
+
+private:
+	unique_ptr<QueryResult> result;
+	unique_ptr<ColumnDataRowCollection> rows;
+};
+
+// Connection::Query completes every statement before it returns, so results can be held while others run
+static unique_ptr<QueryRows> RunSQL(Connection &conn, const string &sql) {
+	return make_uniq<QueryRows>(conn.Query(sql));
+}
+
+static unique_ptr<QueryRows> ExecuteSQL(Connection &conn, const string &sql) {
+	auto result = RunSQL(conn, sql);
 	if (result->HasError()) {
 		throw InvalidInputException("Delta export failed: %s\nSQL: %s", result->GetError(), sql.substr(0, 200));
 	}
@@ -818,7 +854,7 @@ static unique_ptr<MaterializedQueryResult> ExecuteSQL(Connection &conn, const st
 }
 
 template <class T>
-static T ResultValue(MaterializedQueryResult &result, idx_t col, idx_t row, const char *what) {
+static T ResultValue(QueryRows &result, idx_t col, idx_t row, const char *what) {
 	auto value = result.GetValue(col, row);
 	if (value.IsNull()) {
 		throw InvalidInputException("Delta export failed: unexpected NULL in %s, column %d, row %d", what,
@@ -1545,7 +1581,7 @@ static void BuildDeletionVectors(Connection &conn, FileSystem &fs, const Metadat
 	// Deletes DuckLake keeps in the metadata catalog until ducklake_flush_inlined_data; row_id is the file position
 	for (auto &root : roots) {
 		auto tid = std::to_string(root.first);
-		auto inlined = conn.Query(QualifyMetadataTables(
+		auto inlined = RunSQL(conn, QualifyMetadataTables(
 		    "SELECT d.file_id, d.row_id FROM {META}ducklake_inlined_delete_" + tid +
 		        " d JOIN {META}ducklake_data_file df ON df.data_file_id = d.file_id WHERE df.table_id = " + tid +
 		        " AND df.end_snapshot IS NULL",
@@ -1739,7 +1775,7 @@ static void RemoveDroppedTableLogs(Connection &conn, FileSystem &fs) {
 		if (newest_commit.empty()) {
 			continue;
 		}
-		auto commit = conn.Query("SELECT content FROM read_text('" + EscapeSqlString(newest_commit) + "')");
+		auto commit = RunSQL(conn, "SELECT content FROM read_text('" + EscapeSqlString(newest_commit) + "')");
 		if (commit->HasError() || commit->RowCount() == 0 ||
 		    !IsOwnedDeltaLog(commit->GetValue(0, 0).ToString(), table.schema_uuid, table.listed_in_catalog)) {
 			continue;
@@ -1844,19 +1880,19 @@ static constexpr const char *ADD_KEY_SQL = "add.path || '|' || COALESCE(add.dele
 // protocol_versions) from the checkpoint of the previous version. False when it cannot be read.
 static bool LoadPreviousState(Connection &conn, const string &checkpoint) {
 	auto source = "read_parquet('" + EscapeSqlString(checkpoint) + "')";
-	auto adds = conn.Query("CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT " + string(ADD_KEY_SQL) +
+	auto adds = RunSQL(conn, "CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT " + string(ADD_KEY_SQL) +
 	                       " AS k, add.path AS path, add.size AS size, add.deletionVector AS dv FROM " + source +
 	                       " WHERE add IS NOT NULL");
 	if (adds->HasError()) {
 		// checkpoints written before deletion vectors have no add.deletionVector
-		adds = conn.Query("CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT add.path || '|' AS k, add.path AS path, "
+		adds = RunSQL(conn, "CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT add.path || '|' AS k, add.path AS path, "
 		                  "add.size AS size, " +
 		                  string(DV_STRUCT_NULL) + " AS dv FROM " + source + " WHERE add IS NOT NULL");
 		if (adds->HasError()) {
 			return false;
 		}
 	}
-	auto meta = conn.Query(
+	auto meta = RunSQL(conn, 
 	    "CREATE OR REPLACE TEMP TABLE prev_meta AS SELECT "
 	    "(SELECT metaData.id FROM " +
 	    source + " WHERE metaData IS NOT NULL) AS id, (SELECT metaData.schemaString FROM " + source +
