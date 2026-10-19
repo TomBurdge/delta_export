@@ -1264,17 +1264,39 @@ static string DfsToBlobUrl(const string &path) {
 	return string();
 }
 
-// OneLake answers DFS deletes with an error body the Azure SDK cannot parse ("type must be string, but is
-// object"); the blob endpoint, which delta-rs uses on OneLake, deletes the same file fine
+static bool FileStillExists(FileSystem &fs, const string &path) {
+	try {
+		return fs.FileExists(path);
+	} catch (std::exception &) {
+		return true;
+	}
+}
+
+// OneLake answers DFS deletes with a body the Azure SDK cannot parse ("[json.exception.type_error.302] type must
+// be string"), even when the delete went through. Judge by whether the file is still there, and retry through
+// the blob endpoint (the one delta-rs uses on OneLake) when it is.
 static void RemoveFileWithFallback(FileSystem &fs, const string &path) {
+	string first_error;
 	try {
 		fs.RemoveFile(path);
-	} catch (std::exception &) {
-		auto blob_url = DfsToBlobUrl(path);
-		if (blob_url.empty()) {
-			throw;
+		return;
+	} catch (std::exception &ex) {
+		if (!FileStillExists(fs, path)) {
+			return;
 		}
+		first_error = ErrorData(ex).Message();
+	}
+	auto blob_url = DfsToBlobUrl(path);
+	if (blob_url.empty()) {
+		throw IOException("could not delete %s: %s", path, first_error);
+	}
+	try {
 		fs.RemoveFile(blob_url);
+	} catch (std::exception &ex) {
+		if (FileStillExists(fs, path)) {
+			throw IOException("could not delete %s: %s; through the blob endpoint: %s", path, first_error,
+			                  ErrorData(ex).Message());
+		}
 	}
 }
 

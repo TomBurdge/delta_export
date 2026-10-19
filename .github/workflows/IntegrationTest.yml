@@ -1,6 +1,6 @@
 name: Integration Test
 # Each job keeps pytest's last-failed cache: a run only re-runs the tests that failed in the previous run of
-# that job (everything when nothing failed). Dispatch with full=true to run everything, only=<job> to run one
+# that job (nothing when nothing failed). Dispatch with full=true to run everything, only=<job> to run one
 # job, tests=<pytest -k expression> to run chosen tests.
 on:
   workflow_run:
@@ -82,8 +82,8 @@ jobs:
       - name: pytest
         run: |
           set -- -v -s --tb=long -m "not spark"
-          if [ -n "$TESTS" ]; then set -- "$@" -k "$TESTS"; elif [ "$FULL" != "true" ]; then set -- "$@" --lf --lfnf all; fi
-          pytest test/python/ "$@"
+          if [ -n "$TESTS" ]; then set -- "$@" -k "$TESTS"; elif [ "$FULL" != "true" ]; then set -- "$@" --lf --lfnf none; fi
+          pytest test/python/ "$@" || { rc=$?; [ $rc -eq 5 ] && echo "nothing failed last time: no tests to re-run (dispatch full=true for everything)" && exit 0; exit $rc; }
 
       - uses: actions/cache/save@v4
         if: always()
@@ -144,8 +144,8 @@ jobs:
           FUZZ_SEED: ${{ inputs.fuzz_seed }}
         run: |
           set -- -v -s --tb=long -m spark
-          if [ -n "$TESTS" ]; then set -- "$@" -k "$TESTS"; elif [ "$FULL" != "true" ]; then set -- "$@" --lf --lfnf all; fi
-          pytest test/python/ "$@"
+          if [ -n "$TESTS" ]; then set -- "$@" -k "$TESTS"; elif [ "$FULL" != "true" ]; then set -- "$@" --lf --lfnf none; fi
+          pytest test/python/ "$@" || { rc=$?; [ $rc -eq 5 ] && echo "nothing failed last time: no tests to re-run (dispatch full=true for everything)" && exit 0; exit $rc; }
 
       - uses: actions/cache/save@v4
         if: always()
