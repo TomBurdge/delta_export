@@ -1602,20 +1602,6 @@ static void BuildDeletionVectors(Connection &conn, FileSystem &fs, const Metadat
 	}
 }
 
-// Deletion vector files of earlier exports are no longer referenced once the new checkpoint is written
-static void RemoveStaleDeletionVectors(FileSystem &fs, const string &table_root, const string &keep) {
-	auto keep_name = keep.empty() ? string() : BaseName(keep);
-	for (auto &file : GlobOrEmpty(fs, table_root + "/deletion_vector_*.bin")) {
-		if (BaseName(file.path) != keep_name) {
-			try {
-				RemoveFileWithFallback(fs, file.path);
-			} catch (std::exception &) {
-				// best effort: a stale file only costs storage
-			}
-		}
-	}
-}
-
 //===--------------------------------------------------------------------===//
 // Helper: remove the Delta logs of tables dropped in DuckLake
 //===--------------------------------------------------------------------===//
@@ -1982,9 +1968,8 @@ static void DeltaExportScan(ClientContext &context, TableFunctionInput &data, Da
 		                   "TO '" +
 		                   last_checkpoint_file + "' (FORMAT CSV, HEADER false, QUOTE '');";
 		ExecuteSQL(conn, copy_last);
-
-		auto dv_file = dv_files.find(table_id);
-		RemoveStaleDeletionVectors(fs, table_root, dv_file == dv_files.end() ? string() : dv_file->second);
+		// Deletion vector files of earlier exports stay: readers still on the previous version (the Fabric SQL
+		// endpoint caches table metadata) read them. They go with the log when the table is dropped.
 	}
 
 	// Step 9: Remove the Delta logs of tables dropped in DuckLake

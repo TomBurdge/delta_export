@@ -142,7 +142,8 @@ def test_rewrite_after_export_drops_deletion_vector(ducklake_env):
     conn.execute("CALL ducklake_rewrite_data_files('test_lake')")
     _export(conn)
     assert _protocol(conn, root)["minReaderVersion"] == 1
-    assert not any(f.startswith("deletion_vector_") for f in os.listdir(root))
+    # the previous version's deletion vector file stays for readers still on that version
+    assert any(f.startswith("deletion_vector_") for f in os.listdir(root))
     _assert_same_rows(conn, "t", root, ["id"], "id")
 
 
