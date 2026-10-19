@@ -1,0 +1,26 @@
+name: DuckLake filter repro
+# Replays fuzz seeds with plain DuckDB + DuckLake on the local filesystem and shrinks the statements to a
+# minimal script where a filtered count disagrees with a full scan (a DuckLake bug, not delta_export's).
+on:
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: 'Fuzz seeds to replay'
+        default: '21 29'
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install duckdb==1.5.5 pytz
+
+      - run: python test/repro/ducklake_filter_repro.py ${{ inputs.seeds }}
