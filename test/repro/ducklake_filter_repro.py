@@ -1,9 +1,11 @@
 """Find and minimise the DuckLake filter bug seen in the delta_export fuzz tests (seeds 21 and 29).
 
 Plain DuckDB + DuckLake on the local filesystem, no delta_export and no Spark. A filtered count
-(`count(*) ... WHERE pred`, which DuckLake may answer by pruning files on their stats) is compared with
-`count_if(pred)` over a full scan. The statement log of the first mismatch is then shrunk (ddmin) to the
-smallest set of statements that still reproduces it, and printed as a standalone SQL script.
+(`count(*) ... WHERE pred`, which DuckLake may answer by pruning files) is compared with `count_if(pred)` over a
+full scan. The workload replays the fuzz statements exactly, including what delta_export did to the catalog:
+it flushes inlined rows on its own connection (same database, separate client context), and the fuzz
+filters bind Python values as parameters. The statement log of the first mismatch is shrunk (ddmin) to the
+smallest set that still reproduces it and printed as a standalone script.
 
 usage: python ducklake_filter_repro.py <seed> [<seed> ...]
 """
@@ -20,6 +22,8 @@ from fuzz_model import Fuzzer, quote  # noqa: E402
 
 FILTERABLE = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT", "UTINYINT", "USMALLINT", "UINTEGER", "DOUBLE",
               "VARCHAR", "DATE", "TIMESTAMP", "TIMESTAMP WITH TIME ZONE"}
+FLUSH = "CALL ducklake_flush_inlined_data('test_lake')"
+FLUSH_OTHER = FLUSH + "  -- on a second connection to the same database"
 
 
 class Mismatch(Exception):
@@ -39,49 +43,67 @@ def attach(work, inline):
     return conn
 
 
+def execute(conn, statement):
+    if statement == FLUSH_OTHER:
+        conn.cursor().execute(FLUSH)  # what delta_export's internal Connection does
+    else:
+        conn.execute(statement)
+
 
 def checks_for(conn, tables):
-    """(table, where) predicates built from each column's own values."""
+    """(table, where, params): predicates on each column with its own values, bound as parameters (like the
+    fuzz test) and as literals of the column type."""
     for table in tables:
         for name, duck_type, *_ in conn.execute(f"DESCRIBE {table}").fetchall():
             if duck_type.upper() not in FILTERABLE and not duck_type.upper().startswith("DECIMAL"):
                 continue
             q = quote(name)
             values = [r[0] for r in conn.execute(
-                f"SELECT DISTINCT {q}::VARCHAR FROM {table} WHERE {q} IS NOT NULL ORDER BY 1 LIMIT 40").fetchall()]
+                f"SELECT DISTINCT {q} FROM {table} WHERE {q} IS NOT NULL ORDER BY 1 LIMIT 40").fetchall()]
             values += [r[0] for r in conn.execute(
-                f"SELECT {q}::VARCHAR FROM {table} WHERE {q} IS NOT NULL ORDER BY {q} DESC LIMIT 5").fetchall()]
+                f"SELECT {q} FROM {table} WHERE {q} IS NOT NULL ORDER BY {q} DESC LIMIT 5").fetchall()]
             for v in values:
-                lit = "'" + v.replace("'", "''") + "'::" + duck_type
-                yield table, f"{q} = {lit}"
-                yield table, f"{q} > {lit}"
+                if isinstance(v, float) and v != v:
+                    continue
+                yield table, f"{q} = ?", (v,)
+                yield table, f"{q} > ?", (v,)
+                lit = conn.execute(f"SELECT quote(?::{duck_type}::VARCHAR)", [v]).fetchone()[0]
+                yield table, f"{q} = {lit}::{duck_type}", ()
 
 
-def run_check(conn, table, where):
-    filtered = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0]
-    truth = conn.execute(f"SELECT count_if({where}) FROM {table}").fetchone()[0]
+def counts(conn, table, where, params):
+    filtered = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}", list(params)).fetchone()[0]
+    truth = conn.execute(f"SELECT count_if({where}) FROM {table}", list(params)).fetchone()[0]
+    return filtered, truth
+
+
+def run_check(conn, table, where, params):
+    filtered, truth = counts(conn, table, where, params)
     if filtered != truth:
-        raise Mismatch((table, where), filtered, truth)
+        raise Mismatch((table, where, params), filtered, truth)
 
 
 def find_first_mismatch(seed, work):
     conn = attach(work, inline=bool(seed % 2))
 
-    def on_export(fuzzer, rows):
-        tables = [t.qualified for t in fuzzer.tables.values()]
-        for table, where in checks_for(conn, tables):
-            run_check(conn, table, where)
+    def check(fuzzer):
+        for c in checks_for(conn, [t.qualified for t in fuzzer.tables.values()]):
+            run_check(conn, *c)
 
-    fuzzer = Fuzzer(conn, seed, on_export=on_export)
-    # replace the export by the check alone; the statements stay exactly those of the fuzz run
-    # delta_export flushes inlined rows first; keep that step so the catalog evolves the same way
-    fuzzer.op_export = lambda: (fuzzer.sql("CALL ducklake_flush_inlined_data('test_lake')"), on_export(fuzzer, []))
+    fuzzer = Fuzzer(conn, seed)
+
+    def export_step():
+        fuzzer.log.append(FLUSH_OTHER)
+        execute(conn, FLUSH_OTHER)
+        check(fuzzer)
+
+    fuzzer.op_export = export_step
     try:
         fuzzer.run()
     except Mismatch as m:
-        statements = [s for s in fuzzer.log if not s.startswith("  -- refused") and s != "-- check"]
-        refused = {fuzzer.log[i - 1] for i, s in enumerate(fuzzer.log) if s.startswith("  -- refused")}
-        return [s for s in statements if s not in refused and not s.startswith("CALL delta_export")], m
+        refused = {i - 1 for i, s in enumerate(fuzzer.log) if s.startswith("  -- refused")}
+        statements = [s for i, s in enumerate(fuzzer.log) if i not in refused and not s.startswith("  -- refused")]
+        return statements, m
     finally:
         conn.close()
     return None, None
@@ -91,7 +113,7 @@ def reproduces(statements, check, seed, work):
     conn = attach(work, inline=bool(seed % 2))
     try:
         for s in statements:
-            conn.execute(s)
+            execute(conn, s)
         run_check(conn, *check)
         return False
     except Mismatch:
@@ -123,8 +145,11 @@ def ddmin(statements, test):
 
 def main():
     work_root = tempfile.mkdtemp(prefix="ducklake_repro_")
-    print(f"duckdb {duckdb.__version__}; ducklake: "
-          f"{duckdb.connect().execute('INSTALL ducklake; LOAD ducklake; SELECT extension_version FROM duckdb_extensions() WHERE extension_name = ' + chr(39) + 'ducklake' + chr(39)).fetchone()[0]}")
+    probe = duckdb.connect()
+    probe.execute("INSTALL ducklake; LOAD ducklake")
+    version = probe.execute(
+        "SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'ducklake'").fetchone()[0]
+    print(f"duckdb {duckdb.__version__}, ducklake {version}")
     for seed in (int(s) for s in sys.argv[1:]):
         work = os.path.join(work_root, f"seed{seed}")
         statements, mismatch = find_first_mismatch(seed, work)
@@ -133,14 +158,15 @@ def main():
             continue
         print(f"\n=== seed {seed}: {mismatch} after {len(statements)} statements")
         test = lambda subset: reproduces(subset, mismatch.check, seed, work)  # noqa: E731
-        assert test(statements), "the recorded statements do not reproduce on replay"
+        if not test(statements):
+            print("the recorded statements do not reproduce on a fresh replay")
+            continue
         minimal = ddmin(statements, test)
         conn = attach(work, inline=bool(seed % 2))
         for s in minimal:
-            conn.execute(s)
-        table, where = mismatch.check
-        filtered = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}").fetchone()[0]
-        truth = conn.execute(f"SELECT count_if({where}) FROM {table}").fetchone()[0]
+            execute(conn, s)
+        table, where, params = mismatch.check
+        filtered, truth = counts(conn, table, where, params)
         conn.close()
         limit = "" if seed % 2 else ", DATA_INLINING_ROW_LIMIT 0"
         print(f"--- minimal repro for seed {seed} ({len(minimal)} statements) ---")
@@ -149,8 +175,9 @@ def main():
         print("USE test_lake;")
         print("SET TimeZone = 'UTC';")
         for s in minimal:
-            print(s.rstrip(";") + ";")
-        print(f"SELECT count(*) FROM {table} WHERE {where};  -- returns {filtered}")
+            print(s if s == FLUSH_OTHER else s.rstrip(";") + ";")
+        bound = f"  -- ? = {params[0]!r} ({type(params[0]).__name__})" if params else ""
+        print(f"SELECT count(*) FROM {table} WHERE {where};  -- returns {filtered}{bound}")
         print(f"SELECT count_if({where}) FROM {table};  -- returns {truth}")
         print("--- end ---")
 
