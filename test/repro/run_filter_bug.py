@@ -47,6 +47,17 @@ print("count_if over a materialised copy:", conn.execute(
     "count(*) FILTER (c7 > -49791089.6266012800::DECIMAL(38,10)) FROM copy").fetchone())
 print("filtered over the copy:", conn.execute(
     "SELECT count(*) FROM copy WHERE c7 > -49791089.6266012800::DECIMAL(38,10)").fetchone()[0])
+for label, sql in [
+    ("t2:   SELECT c7 (only column)", "SELECT count(*), count(c7), sum(c7) FROM (SELECT c7 FROM t2)"),
+    ("t2:   SELECT id, c7", "SELECT count(*), count(c7), sum(c7) FROM (SELECT id, c7 FROM t2)"),
+    ("t2:   SELECT *", "SELECT count(*), count(c7), sum(c7) FROM (SELECT * FROM t2)"),
+    ("copy: SELECT c7", "SELECT count(*), count(c7), sum(c7) FROM (SELECT c7 FROM copy)"),
+]:
+    print(f"{label:30}", conn.execute(sql).fetchone())
+extra = conn.execute(
+    "SELECT c7, count(*) FROM (SELECT c7 FROM t2) GROUP BY c7 "
+    "EXCEPT ALL SELECT c7, count(*) FROM (SELECT c7 FROM copy) GROUP BY c7").fetchall()
+print("c7 values the single-column scan returns too often:", extra[:5])
 print("ids the filtered query misses:", sorted(truth - rows_filtered)[:20])
 for i in sorted(truth - rows_filtered)[:5]:
     print("  ", all_rows[i])
