@@ -232,7 +232,8 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
 
         # sync the endpoint to the new versions; the dropped table has no log any more
         synced = endpoint.sync(SCHEMA, [dv, part, widen, renamed, dropped])
-        assert all(synced.get(t, ("missing",))[0] == "Success" for t in (dv, part, widen, renamed)), synced
+        # NotRun: nothing left to sync for that table (already current); the data comparison below decides
+        assert all(synced.get(t, ("missing",))[0] in ("Success", "NotRun") for t in (dv, part, widen, renamed)), synced
         seen = endpoint.tables(prefix)
         assert {dv, part, widen, renamed} <= set(seen) and dropped not in seen, seen
 
