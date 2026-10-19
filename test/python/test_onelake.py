@@ -96,22 +96,33 @@ class SqlEndpoint:
         self.database = item["displayName"]
         self._conn = None
 
-    def refresh(self):
-        """Ask the endpoint to sync the lakehouse's Delta metadata now (instead of waiting for its schedule)."""
-        status, headers, _ = _fabric("POST", f"/workspaces/{self.workspace}/sqlEndpoints/{self.id}/refreshMetadata", {})
-        location = headers.get("Location") or headers.get("location")
-        deadline = time.time() + 600
-        while status == 202 and location and time.time() < deadline:
-            time.sleep(int(headers.get("Retry-After", "5")))
-            status, headers, body = _fabric("GET", location)
-            state = body.get("status")
-            if state in ("Succeeded", "Completed"):
-                return
-            if state == "Failed":
-                raise AssertionError(f"SQL endpoint metadata refresh failed: {body}")
-            status = 202
+    def sync(self, schema, tables):
+        """Refresh SQL Endpoint Metadata for these tables only and wait for it: {schema.table: status, error}.
+
+        POST .../refreshMetadata answers 200 with the per-table statuses, or 202 with a long running operation
+        whose result (GET <Location>/result) holds them.
+        """
+        body = {"tables": [{"schema": schema, "tableNames": list(tables)}],
+                "timeout": {"timeUnit": "Minutes", "value": 10}}
+        status, headers, result = _fabric("POST", f"/workspaces/{self.workspace}/sqlEndpoints/{self.id}/refreshMetadata", body)
         if status == 202:
-            raise AssertionError("SQL endpoint metadata refresh did not finish in 10 minutes")
+            location = headers.get("Location") or headers.get("location")
+            deadline = time.time() + 900
+            while True:
+                time.sleep(int(headers.get("Retry-After", "5")))
+                _, headers, operation = _fabric("GET", location)
+                state = operation.get("status")
+                if state == "Succeeded":
+                    break
+                if state == "Failed" or time.time() > deadline:
+                    raise AssertionError(f"SQL endpoint metadata refresh {state}: {operation}")
+            _, _, result = _fabric("GET", location.rstrip("/") + "/result")
+        statuses = {}
+        for entry in result.get("value", []):
+            name = entry["tableName"].split(".", 1)[-1]
+            statuses[name] = (entry["status"], (entry.get("error") or {}).get("message"))
+        print(f"SQL endpoint sync: {statuses}")
+        return statuses
 
     def query(self, sql, params=()):
         if self._conn is None:
@@ -129,17 +140,6 @@ class SqlEndpoint:
     def tables(self, prefix):
         return {r[1]: r[0] for r in self.query(
             "SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME LIKE ?", (prefix + "%",))}
-
-    def wait_for(self, prefix, present, absent=(), timeout=600):
-        deadline = time.time() + timeout
-        while True:
-            seen = self.tables(prefix)
-            if set(present) <= set(seen) and not set(absent) & set(seen):
-                return seen
-            if time.time() > deadline:
-                raise AssertionError(f"SQL endpoint shows {sorted(seen)}; expected {sorted(present)} and not {sorted(absent)}")
-            time.sleep(15)
-            self.refresh()
 
 
 @pytest.fixture
@@ -207,8 +207,10 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
         assert all(status[q(t)] == "needs_export" for t in (dv, part, widen, renamed, dropped)), status
 
         endpoint = SqlEndpoint(workspace, lakehouse)
-        endpoint.refresh()
-        seen = endpoint.wait_for(prefix, present=[dv, part, widen, renamed, dropped])
+        synced = endpoint.sync(SCHEMA, [dv, part, widen, renamed, dropped])
+        assert all(synced.get(t, ("missing",))[0] == "Success" for t in (dv, part, widen, renamed, dropped)), synced
+        seen = endpoint.tables(prefix)
+        assert {dv, part, widen, renamed, dropped} <= set(seen), seen
 
         # second round: more deletes, a rename (held back) and a drop (log removed)
         conn.execute(f"MERGE INTO {q(dv)} AS tgt USING (SELECT i AS id FROM range(19900, 20100) t(i)) AS src "
@@ -228,23 +230,16 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
             assert conn.execute(f"SELECT count(*) FROM delta_scan('{root}')").fetchone()[0] == \
                 conn.execute(f"SELECT count(*) FROM {q(t)}").fetchone()[0], t
 
-        endpoint.refresh()
-        seen = endpoint.wait_for(prefix, present=[dv, part, widen, renamed], absent=[dropped])
+        # sync the endpoint to the new versions; the dropped table has no log any more
+        synced = endpoint.sync(SCHEMA, [dv, part, widen, renamed, dropped])
+        assert all(synced.get(t, ("missing",))[0] == "Success" for t in (dv, part, widen, renamed)), synced
+        seen = endpoint.tables(prefix)
+        assert {dv, part, widen, renamed} <= set(seen) and dropped not in seen, seen
 
-        def both(duck_sql, sql_endpoint_sql, timeout=600):
-            """The endpoint syncs Delta metadata eventually: retry (with a refresh) until it shows the latest
-            version, then the answers must be equal."""
+        def both(duck_sql, sql_endpoint_sql):
             want = tuple(conn.execute(duck_sql).fetchone())
-            deadline = time.time() + timeout
-            while True:
-                got = tuple(endpoint.query(sql_endpoint_sql)[0])
-                if got == want:
-                    return
-                if time.time() > deadline:
-                    raise AssertionError(f"SQL endpoint {got} != DuckLake {want} after {timeout}s\n  {sql_endpoint_sql}")
-                print(f"SQL endpoint not caught up yet: {got} vs {want}; refreshing")
-                time.sleep(15)
-                endpoint.refresh()
+            got = tuple(endpoint.query(sql_endpoint_sql)[0])
+            assert got == want, f"SQL endpoint {got} != DuckLake {want}\n  {sql_endpoint_sql}"
 
         fq = lambda t: f"[{seen[t]}].[{t}]"  # noqa: E731
         both(f"SELECT count(*), sum(id), count(DISTINCT name), count(*) FILTER (name = 'updated') FROM {q(dv)}",
