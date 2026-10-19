@@ -1233,14 +1233,6 @@ static string EscapeSqlString(const string &input) {
 	return StringUtil::Replace(input, "'", "''");
 }
 
-static vector<OpenFileInfo> GlobOrEmpty(FileSystem &fs, const string &pattern) {
-	try {
-		return fs.Glob(pattern);
-	} catch (std::exception &) {
-		return {};
-	}
-}
-
 //! abfs[s]://<container>@<account>.dfs.<suffix>/<path> -> az://<account>.blob.<suffix>/<container>/<path>, or ""
 static string DfsToBlobUrl(const string &path) {
 	for (auto prefix : {"abfss://", "abfs://"}) {
@@ -1297,6 +1289,28 @@ static void RemoveFileWithFallback(FileSystem &fs, const string &path) {
 			throw IOException("could not delete %s: %s; through the blob endpoint: %s", path, first_error,
 			                  ErrorData(ex).Message());
 		}
+	}
+}
+
+// Some OneLake DFS listings come back in a shape the Azure SDK cannot parse ("type must be string, but is
+// number"); list the same folder through the blob endpoint then
+static vector<OpenFileInfo> GlobWithFallback(FileSystem &fs, const string &pattern) {
+	try {
+		return fs.Glob(pattern);
+	} catch (std::exception &) {
+		auto blob_pattern = DfsToBlobUrl(pattern);
+		if (blob_pattern.empty()) {
+			throw;
+		}
+		return fs.Glob(blob_pattern);
+	}
+}
+
+static vector<OpenFileInfo> GlobOrEmpty(FileSystem &fs, const string &pattern) {
+	try {
+		return GlobWithFallback(fs, pattern);
+	} catch (std::exception &) {
+		return {};
 	}
 }
 
@@ -1619,12 +1633,12 @@ static bool IsOwnedDeltaLog(const string &commit, const string &schema_uuid, boo
 
 static void RemoveDeltaLog(FileSystem &fs, const string &table_root) {
 	auto delta_log = table_root + "/_delta_log";
-	for (auto &file : fs.Glob(delta_log + "/*")) {
+	for (auto &file : GlobWithFallback(fs, delta_log + "/*")) {
 		if (!FileSystem::IsDirectory(file)) {
 			RemoveFileWithFallback(fs, file.path);
 		}
 	}
-	for (auto &file : fs.Glob(table_root + "/deletion_vector_*.bin")) {
+	for (auto &file : GlobWithFallback(fs, table_root + "/deletion_vector_*.bin")) {
 		RemoveFileWithFallback(fs, file.path);
 	}
 	if (!IsRemotePath(table_root) && fs.DirectoryExists(delta_log)) {
@@ -1671,9 +1685,12 @@ static void RemoveDroppedTableLogs(Connection &conn, FileSystem &fs) {
 	const string checkpoint_suffix = "/_delta_log/_last_checkpoint";
 	for (idx_t i = 0; i < schemas->RowCount(); i++) {
 		auto schema_root = schemas->GetValue(2, i).ToString();
+		auto schema_prefix = NormalizePath(schema_root) + "/";
 		for (auto &hit : GlobOrEmpty(fs, schema_root + "/*" + checkpoint_suffix)) {
 			auto path = NormalizePath(hit.path);
-			if (!StringUtil::EndsWith(path, checkpoint_suffix)) {
+			// a listing that fell back to the blob endpoint names paths differently from the live table roots;
+			// never take those for dropped tables
+			if (!StringUtil::StartsWith(path, schema_prefix) || !StringUtil::EndsWith(path, checkpoint_suffix)) {
 				continue;
 			}
 			auto root = path.substr(0, path.size() - checkpoint_suffix.size());
