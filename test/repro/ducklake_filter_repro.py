@@ -67,8 +67,8 @@ def checks_for(conn, tables):
                     continue
                 yield table, f"{q} = ?", (v,)
                 yield table, f"{q} > ?", (v,)
-                lit = conn.execute(f"SELECT quote(?::{duck_type}::VARCHAR)", [v]).fetchone()[0]
-                yield table, f"{q} = {lit}::{duck_type}", ()
+                text = conn.execute(f"SELECT ?::{duck_type}::VARCHAR", [v]).fetchone()[0]
+                yield table, f"{q} = '{text.replace(chr(39), chr(39) * 2)}'::{duck_type}", ()
 
 
 def counts(conn, table, where, params):
