@@ -39,7 +39,7 @@ Three workflows:
 
 ## DuckDB 2.0 API
 
-- Targets DuckDB 2.0 only. Tests: `duckdb` submodule = the commit of the pinned Python dev wheel (`duckdb==2.0.0.dev2610162032`, f8f3f4dcd9, in IntegrationTest.yml and DuckLakeRepro.yml); an extension loads only into the exact DuckDB build it was compiled for. Release: MainDistributionPipeline builds at the commit community-extensions uses (`b15358c`, v2.0.0-alpha46057), with extension-ci-tools `v2.0-cyanoptera`. Re-pin both to `v2.0.0` once it is released.
+- Targets DuckDB 2.0 only. Tests: `duckdb` submodule = the commit of the pinned Python dev wheel (`duckdb==2.0.0.dev2610162032`, f8f3f4dcd9, in IntegrationTest.yml and DuckLakeRepro.yml; LinuxBuild.yml stamps its version `v2.0.0-alpha48730` via `OVERRIDE_GIT_DESCRIBE`); an extension loads only into the exact DuckDB build it was compiled for. Release: MainDistributionPipeline builds at the commit community-extensions uses (`b15358c`, v2.0.0-alpha46057), with extension-ci-tools `v2.0-cyanoptera`. Re-pin both to `v2.0.0` once it is released.
 - Catalog names (`AttachedDatabase::GetName()`, `DatabaseManager::GetDefaultDatabase()`) are `Identifier`s; convert explicitly with `static_cast<const string &>(...)`.
 - DuckLake on DuckDB >= 1.5.3 attaches its metadata catalog `HIDDEN`, so it is absent from `duckdb_databases()`. Never discover it through SQL; `ResolveMetadataLocation` enumerates `DatabaseManager::GetDatabases` (includes hidden entries) from the main context. Hidden catalogs still resolve by name in queries.
 - Use `ExtensionLoader`, not `ExtensionUtil` (removed). No `#define DUCKDB_EXTENSION_MAIN`.

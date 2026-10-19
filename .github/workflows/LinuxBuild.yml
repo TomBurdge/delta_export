@@ -43,6 +43,9 @@ jobs:
         run: make release
         env:
           GEN: ninja
+          # The submodule checkout has no tags, so DuckDB would stamp the raw commit hash; the test wheel reports
+          # this version and only loads extensions stamped with it
+          OVERRIDE_GIT_DESCRIBE: v2.0.0-alpha48730
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
 
