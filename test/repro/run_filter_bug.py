@@ -58,6 +58,19 @@ extra = conn.execute(
     "SELECT c7, count(*) FROM (SELECT c7 FROM t2) GROUP BY c7 "
     "EXCEPT ALL SELECT c7, count(*) FROM (SELECT c7 FROM copy) GROUP BY c7").fetchall()
 print("c7 values the single-column scan returns too often:", extra[:5])
+meta = '"__ducklake_metadata_lake"'
+print("actual min/max of c7:", conn.execute("SELECT min(c7), max(c7) FROM copy").fetchone())
+print("ducklake_table_column_stats for c7:", conn.execute(
+    f"SELECT s.* FROM {meta}.ducklake_table_column_stats s JOIN {meta}.ducklake_column c "
+    f"ON c.table_id = s.table_id AND c.column_id = s.column_id AND c.end_snapshot IS NULL "
+    f"WHERE c.column_name = 'c7'").fetchall())
+print("ducklake_file_column_stats for c7 (active files):", conn.execute(
+    f"SELECT f.data_file_id, f.min_value, f.max_value, f.null_count FROM {meta}.ducklake_file_column_stats f "
+    f"JOIN {meta}.ducklake_data_file d ON d.data_file_id = f.data_file_id AND d.end_snapshot IS NULL "
+    f"JOIN {meta}.ducklake_column c ON c.table_id = d.table_id AND c.column_id = f.column_id "
+    f"AND c.end_snapshot IS NULL WHERE c.column_name = 'c7' ORDER BY 1").fetchall())
+print(conn.execute(
+    "EXPLAIN SELECT count_if(c7 > -49791089.6266012800::DECIMAL(38,10)) FROM t2").fetchall()[0][1])
 print("ids the filtered query misses:", sorted(truth - rows_filtered)[:20])
 for i in sorted(truth - rows_filtered)[:5]:
     print("  ", all_rows[i])
