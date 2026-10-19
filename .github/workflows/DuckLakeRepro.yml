@@ -21,7 +21,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      - run: pip install duckdb==1.5.6 pytz
+      - run: pip install duckdb==2.0.0.dev2610162032 pytz
 
       - name: Minimal script (test/repro/ducklake_filter_bug.sql)
         run: python test/repro/run_filter_bug.py

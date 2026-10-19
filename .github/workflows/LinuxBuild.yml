@@ -36,7 +36,7 @@ jobs:
 
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
-          key: linux-amd64-duckdb-v1.5.6
+          key: linux-amd64-duckdb-f8f3f4dcd9
           max-size: 2G
 
       - name: Build extension

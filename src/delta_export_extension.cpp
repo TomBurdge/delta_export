@@ -9,6 +9,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/database_manager.hpp"
+#include "duckdb/main/materialized_query_result.hpp"
 #include "duckdb/main/prepared_statement.hpp"
 #include "duckdb/common/error_data.hpp"
 #include "duckdb/common/numeric_utils.hpp"
@@ -741,7 +742,7 @@ static MetadataLocation ResolveMetadataLocation(ClientContext &context) {
 	auto &db_manager = DatabaseManager::Get(context);
 	string default_db;
 	try {
-		default_db = DatabaseManager::GetDefaultDatabase(context);
+		default_db = static_cast<const string &>(DatabaseManager::GetDefaultDatabase(context));
 	} catch (...) {
 		// no default database set; fall back to the first attached lake
 	}
@@ -753,7 +754,8 @@ static MetadataLocation ResolveMetadataLocation(ClientContext &context) {
 		if (db->IsSystem() || db->IsTemporary()) {
 			continue;
 		}
-		auto &name = db->GetName();
+		// Catalog names are Identifiers, which convert to a string only explicitly
+		const string &name = static_cast<const string &>(db->GetName());
 		if (db->GetCatalog().GetCatalogType() == "ducklake") {
 			MetadataLocation loc;
 			loc.catalog = "__ducklake_metadata_" + name;

@@ -37,9 +37,10 @@ Three workflows:
 2. **IntegrationTest.yml** — runs after LinuxBuild or on `test/python/**` changes. Downloads artifact, runs pytest.
 3. **MainDistributionPipeline.yml** — full multi-platform build, manual only (`workflow_dispatch`).
 
-## DuckDB v1.5.x API
+## DuckDB 2.0 API
 
-- Pinned to v1.5.6 (submodules `duckdb` and `extension-ci-tools`, workflow versions, pip pin in IntegrationTest.yml) — keep all four in sync.
+- Targets DuckDB 2.0 only. Tests: `duckdb` submodule = the commit of the pinned Python dev wheel (`duckdb==2.0.0.dev2610162032`, f8f3f4dcd9, in IntegrationTest.yml and DuckLakeRepro.yml); an extension loads only into the exact DuckDB build it was compiled for. Release: MainDistributionPipeline builds at the commit community-extensions uses (`b15358c`, v2.0.0-alpha46057), with extension-ci-tools `v2.0-cyanoptera`. Re-pin both to `v2.0.0` once it is released.
+- Catalog names (`AttachedDatabase::GetName()`, `DatabaseManager::GetDefaultDatabase()`) are `Identifier`s; convert explicitly with `static_cast<const string &>(...)`.
 - DuckLake on DuckDB >= 1.5.3 attaches its metadata catalog `HIDDEN`, so it is absent from `duckdb_databases()`. Never discover it through SQL; `ResolveMetadataLocation` enumerates `DatabaseManager::GetDatabases` (includes hidden entries) from the main context. Hidden catalogs still resolve by name in queries.
 - Use `ExtensionLoader`, not `ExtensionUtil` (removed). No `#define DUCKDB_EXTENSION_MAIN`.
 - `Connection::Query()` returns `unique_ptr<MaterializedQueryResult>` directly.

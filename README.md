@@ -91,7 +91,7 @@ For a production example using delta_export with dbt, see https://github.com/djo
 
 ## Requirements
 
-- DuckDB v1.5.x+ (built and tested against v1.5.6)
+- DuckDB 2.0
 
 
 ## License
