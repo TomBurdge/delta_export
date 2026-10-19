@@ -231,10 +231,20 @@ def test_onelake_export_read_by_sql_endpoint(onelake):
         endpoint.refresh()
         seen = endpoint.wait_for(prefix, present=[dv, part, widen, renamed], absent=[dropped])
 
-        def both(duck_sql, sql_endpoint_sql):
+        def both(duck_sql, sql_endpoint_sql, timeout=600):
+            """The endpoint syncs Delta metadata eventually: retry (with a refresh) until it shows the latest
+            version, then the answers must be equal."""
             want = tuple(conn.execute(duck_sql).fetchone())
-            got = endpoint.query(sql_endpoint_sql)[0]
-            assert tuple(got) == want, f"SQL endpoint {got} != DuckLake {want}\n  {sql_endpoint_sql}"
+            deadline = time.time() + timeout
+            while True:
+                got = tuple(endpoint.query(sql_endpoint_sql)[0])
+                if got == want:
+                    return
+                if time.time() > deadline:
+                    raise AssertionError(f"SQL endpoint {got} != DuckLake {want} after {timeout}s\n  {sql_endpoint_sql}")
+                print(f"SQL endpoint not caught up yet: {got} vs {want}; refreshing")
+                time.sleep(15)
+                endpoint.refresh()
 
         fq = lambda t: f"[{seen[t]}].[{t}]"  # noqa: E731
         both(f"SELECT count(*), sum(id), count(DISTINCT name), count(*) FILTER (name = 'updated') FROM {q(dv)}",
