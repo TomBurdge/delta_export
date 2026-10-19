@@ -1,0 +1,34 @@
+name: DuckDB 2.0 wheel probe
+# Prints the DuckDB revision of each 2.0 dev wheel and whether DuckLake installs on it, to pick the
+# DuckDB commit the extension is built and tested against.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        wheel: [2.0.0.dev2610011535, 2.0.0.dev2610151406, 2.0.0.dev2610161340, 2.0.0.dev2610162032]
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install "duckdb==${{ matrix.wheel }}"
+      - run: |
+          python - <<'EOF'
+          import duckdb
+          print("wheel", duckdb.__version__, "git", getattr(duckdb, "__git_revision__", "?"))
+          con = duckdb.connect()
+          print(con.sql("SELECT version(), source_id, library_version FROM pragma_version()").fetchall())
+          print(con.sql("PRAGMA platform").fetchall())
+          try:
+              con.sql("INSTALL ducklake; LOAD ducklake")
+              print("ducklake OK", con.sql("SELECT extension_version, installed_from FROM duckdb_extensions() WHERE extension_name = 'ducklake'").fetchall())
+          except Exception as e:
+              print("ducklake FAILED", e)
+          EOF
