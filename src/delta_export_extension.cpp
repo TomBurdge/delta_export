@@ -1920,7 +1920,7 @@ struct DeltaExportGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> DeltaExportBind(ClientContext &context, TableFunctionBindInput &input,
-                                                vector<LogicalType> &return_types, vector<string> &names) {
+                                                vector<LogicalType> &return_types, vector<Identifier> &names) {
 	names.emplace_back("table_name");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
