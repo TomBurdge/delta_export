@@ -1581,11 +1581,12 @@ static void BuildDeletionVectors(Connection &conn, FileSystem &fs, const Metadat
 	// Deletes DuckLake keeps in the metadata catalog until ducklake_flush_inlined_data; row_id is the file position
 	for (auto &root : roots) {
 		auto tid = std::to_string(root.first);
-		auto inlined = RunSQL(conn, QualifyMetadataTables(
-		    "SELECT d.file_id, d.row_id FROM {META}ducklake_inlined_delete_" + tid +
-		        " d JOIN {META}ducklake_data_file df ON df.data_file_id = d.file_id WHERE df.table_id = " + tid +
-		        " AND df.end_snapshot IS NULL",
-		    meta));
+		auto inlined = RunSQL(
+		    conn, QualifyMetadataTables(
+		              "SELECT d.file_id, d.row_id FROM {META}ducklake_inlined_delete_" + tid +
+		                  " d JOIN {META}ducklake_data_file df ON df.data_file_id = d.file_id WHERE df.table_id = " +
+		                  tid + " AND df.end_snapshot IS NULL",
+		              meta));
 		if (inlined->HasError()) {
 			if (inlined->GetErrorType() == ExceptionType::CATALOG) {
 				continue; // the table never had inlined deletes
@@ -1881,26 +1882,28 @@ static constexpr const char *ADD_KEY_SQL = "add.path || '|' || COALESCE(add.dele
 static bool LoadPreviousState(Connection &conn, const string &checkpoint) {
 	auto source = "read_parquet('" + EscapeSqlString(checkpoint) + "')";
 	auto adds = RunSQL(conn, "CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT " + string(ADD_KEY_SQL) +
-	                       " AS k, add.path AS path, add.size AS size, add.deletionVector AS dv FROM " + source +
-	                       " WHERE add IS NOT NULL");
+	                             " AS k, add.path AS path, add.size AS size, add.deletionVector AS dv FROM " + source +
+	                             " WHERE add IS NOT NULL");
 	if (adds->HasError()) {
 		// checkpoints written before deletion vectors have no add.deletionVector
 		adds = RunSQL(conn, "CREATE OR REPLACE TEMP TABLE prev_adds AS SELECT add.path || '|' AS k, add.path AS path, "
-		                  "add.size AS size, " +
-		                  string(DV_STRUCT_NULL) + " AS dv FROM " + source + " WHERE add IS NOT NULL");
+		                    "add.size AS size, " +
+		                        string(DV_STRUCT_NULL) + " AS dv FROM " + source + " WHERE add IS NOT NULL");
 		if (adds->HasError()) {
 			return false;
 		}
 	}
-	auto meta = RunSQL(conn, 
+	auto meta = RunSQL(
+	    conn,
 	    "CREATE OR REPLACE TEMP TABLE prev_meta AS SELECT "
 	    "(SELECT metaData.id FROM " +
-	    source + " WHERE metaData IS NOT NULL) AS id, (SELECT metaData.schemaString FROM " + source +
-	    " WHERE metaData IS NOT NULL) AS schema_string, (SELECT to_json(metaData.configuration)::VARCHAR FROM " +
-	    source +
-	    " WHERE metaData IS NOT NULL) AS configuration, (SELECT CAST(protocol.minReaderVersion AS VARCHAR) || ',' || "
-	    "CAST(protocol.minWriterVersion AS VARCHAR) FROM " +
-	    source + " WHERE protocol IS NOT NULL) AS protocol_versions");
+	        source + " WHERE metaData IS NOT NULL) AS id, (SELECT metaData.schemaString FROM " + source +
+	        " WHERE metaData IS NOT NULL) AS schema_string, (SELECT to_json(metaData.configuration)::VARCHAR FROM " +
+	        source +
+	        " WHERE metaData IS NOT NULL) AS configuration, (SELECT CAST(protocol.minReaderVersion AS VARCHAR) || ',' "
+	        "|| "
+	        "CAST(protocol.minWriterVersion AS VARCHAR) FROM " +
+	        source + " WHERE protocol IS NOT NULL) AS protocol_versions");
 	return !meta->HasError();
 }
 
