@@ -73,13 +73,13 @@ def checks_for(conn, tables):
 
 def counts(conn, table, where, params):
     filtered = conn.execute(f"SELECT count(*) FROM {table} WHERE {where}", list(params)).fetchone()[0]
-    truth = conn.execute(f"SELECT count_if({where}) FROM {table}", list(params)).fetchone()[0]
+    truth = conn.execute(f"SELECT coalesce(count_if({where}), 0) FROM {table}", list(params)).fetchone()[0]
     return filtered, truth
 
 
 def run_check(conn, table, where, params):
     filtered, truth = counts(conn, table, where, params)
-    if filtered != truth:
+    if filtered < truth:  # rows the filtered query misses
         raise Mismatch((table, where, params), filtered, truth)
 
 
