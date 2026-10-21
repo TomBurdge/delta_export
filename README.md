@@ -87,7 +87,7 @@ Rewriting files with deletes (`ducklake_rewrite_data_files`) is no longer requir
 
 ## Real-world example
 
-For a production example using delta_export with dbt, see https://github.com/djouallah/dbt
+For a real-world DuckLake project using delta_export with dbt on Microsoft Fabric, see https://github.com/djouallah/fabric-dbt-examples
 
 ## Requirements
 
