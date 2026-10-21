@@ -1971,6 +1971,9 @@ static vector<string> ListOption(TableFunctionBindInput &input, const char *opti
 	}
 	if (!entry->second.IsNull()) {
 		for (auto &name : ListValue::GetChildren(entry->second)) {
+			if (name.IsNull()) {
+				throw InvalidInputException("Delta export failed: %s must not contain NULL", option);
+			}
 			names.push_back(name.ToString());
 		}
 	}

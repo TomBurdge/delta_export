@@ -96,6 +96,8 @@ def test_unknown_or_empty_names_fail(conn):
         _export(conn, tables=[])
     with pytest.raises(duckdb.Error, match="schemas must not be empty"):
         _export(conn, schemas=[])
+    with pytest.raises(duckdb.Error, match="tables must not contain NULL"):
+        conn.execute("SELECT * FROM delta_export(tables := ['t', NULL])")
 
 
 def test_named_tables_keep_dropped_table_log(ducklake_env):
